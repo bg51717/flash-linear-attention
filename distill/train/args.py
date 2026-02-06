@@ -9,6 +9,10 @@ class ModelArguments:
         default="gated_deltanet",
         metadata={"help": "Type of linear attention mechanism to use."}
     )
+    teacher_model: str = field(
+        default=None,
+        metadata={"help": "Path to the teacher model for distillation."}
+    )
 
 @dataclass
 class DataArguments:

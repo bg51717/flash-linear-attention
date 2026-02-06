@@ -78,7 +78,7 @@ class MSETrainer(Trainer):
 
 
 def load_model_tokenizer(model_args):
-    model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
+    model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path).cuda()
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token

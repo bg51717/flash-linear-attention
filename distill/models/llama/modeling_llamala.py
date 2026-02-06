@@ -5,6 +5,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaPreTrainedModel,
     LlamaForCausalLM,
 )
+from fla.models.utils import FLAGenerationMixin
 
 from .configuration_llamala import LlamaLAConfig
 from .utils import init_attention_module
@@ -33,7 +34,7 @@ class LlamaLAModel(LlamaLAPreTrainedModel, LlamaModel):
         )
 
 
-class LlamaLAForCausalLM(LlamaLAPreTrainedModel, LlamaForCausalLM):
+class LlamaLAForCausalLM(FLAGenerationMixin, LlamaLAPreTrainedModel, LlamaForCausalLM):
     def __init__(self, config):
         super().__init__(config)
         self.model = LlamaLAModel(config)
