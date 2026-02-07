@@ -1,7 +1,11 @@
 from fla.layers import gated_deltanet
 
+from . import linear_attention_pdf
+
 TYPE2ATTN = {
     "gated_deltanet": gated_deltanet.GatedDeltaNet,
+    "pdf_linear_attention": linear_attention_pdf.FirstOrderLinearAttention,
+    "first_order_linear_attention": linear_attention_pdf.FirstOrderLinearAttention,
 }
 
 CONFIG2KWARGS = {
@@ -18,6 +22,42 @@ CONFIG2KWARGS = {
             >= cfg.num_attention_heads
             else cfg.num_attention_heads
         ),
+    },
+    "pdf_linear_attention": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_v_heads": lambda cfg: (
+            getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            if getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            >= cfg.num_attention_heads
+            else cfg.num_attention_heads
+        ),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+    },
+    "first_order_linear_attention": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_v_heads": lambda cfg: (
+            getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            if getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            >= cfg.num_attention_heads
+            else cfg.num_attention_heads
+        ),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
     },
 }
 

@@ -6,7 +6,7 @@ class LlamaLAConfig(LlamaConfig):
 
     def __init__(
         self,
-        linear_attention_type: int = None,
+        linear_attention_type: str | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
