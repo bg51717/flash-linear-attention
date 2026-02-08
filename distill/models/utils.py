@@ -1,4 +1,5 @@
 from fla.layers import gated_deltanet
+import torch
 
 from . import linear_attention_pdf
 
@@ -83,6 +84,17 @@ def init_attention_module(config, layer_idx: int):
             super().__init__(*args, **kwargs)
 
         def forward(self, *args, **kwargs):
+            attention_mask = kwargs.get("attention_mask", None)
+            if attention_mask is not None and attention_mask.dim() == 4:
+                # HF eager/sdpa can pass a 4D causal mask [B, 1, Q, K]. The FLA
+                # layers expect a 2D padding mask [B, K] (True for valid tokens).
+                attention_mask_2d = attention_mask[:, 0, -1, :]
+                if attention_mask_2d.dtype != torch.bool:
+                    # For eager masks, valid positions are 0 and masked are -inf.
+                    attention_mask_2d = attention_mask_2d.eq(0)
+                kwargs = {**kwargs}
+                kwargs.update({"attention_mask": attention_mask_2d})
+
             outputs = super().forward(*args, **kwargs)
             assert len(outputs) == 3, (
                 "Expected linear attention output to be a tuple of (attn_output, attn_weights, extra_info)"

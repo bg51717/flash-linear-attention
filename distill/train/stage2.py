@@ -54,12 +54,12 @@ class DistillationTrainer(Trainer):
         return loss
 
 
-def load_model_tokenizer(model_args):
+def load_model_tokenizer(ckpt_path):
     model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=True
+        ckpt_path, trust_remote_code=True
     ).cuda()
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, trust_remote_code=True
+        ckpt_path, trust_remote_code=True
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -72,7 +72,12 @@ def main():
     parser.add_arguments(TrainingArguments, dest="train")
     parser.add_arguments(DataArguments, dest="data")
     args = parser.parse_args()
-    model, tokenizer = load_model_tokenizer(args.model)
+    model, tokenizer = load_model_tokenizer(args.model.model_name_or_path)
+    for name, param in model.named_parameters():
+        if "attn" in name:
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
     train_dataset = prapare_dataset(tokenizer, args.data, split="train")
     # Train
     teacher_model, _ = load_model_tokenizer(args.model.teacher_model)

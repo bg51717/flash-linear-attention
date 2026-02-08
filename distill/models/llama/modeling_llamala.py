@@ -39,6 +39,7 @@ class LlamaLAForCausalLM(FLAGenerationMixin, LlamaLAPreTrainedModel, LlamaForCau
         super().__init__(config)
         self.model = LlamaLAModel(config)
 
+LlamaForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 
 __all__ = [
     "LlamaLADecoderLayer",

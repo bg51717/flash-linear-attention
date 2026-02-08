@@ -12,4 +12,4 @@ class LlamaLAConfig(LlamaConfig):
         super().__init__(**kwargs)
         self.linear_attention_type = linear_attention_type
 
-LlamaLAConfig.register_for_auto_class()
+LlamaLAConfig.register_for_auto_class("AutoConfig")
