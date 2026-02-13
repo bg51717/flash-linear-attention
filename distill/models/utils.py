@@ -1,12 +1,12 @@
 from fla.layers import gated_deltanet
 import torch
 
-from . import linear_attention_pdf
+from .linear_attention_pdf import FirstOrderLinearAttention
 
 TYPE2ATTN = {
     "gated_deltanet": gated_deltanet.GatedDeltaNet,
-    "pdf_linear_attention": linear_attention_pdf.FirstOrderLinearAttention,
-    "first_order_linear_attention": linear_attention_pdf.FirstOrderLinearAttention,
+    "pdf_linear_attention": FirstOrderLinearAttention,
+    "first_order_linear_attention": FirstOrderLinearAttention,
 }
 
 CONFIG2KWARGS = {

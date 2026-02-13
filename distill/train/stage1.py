@@ -34,8 +34,12 @@ remote_code_dirs = {
     "llama": "models/llama",
 }
 
-utils_file = "models/utils.py"
-
+utils_files = {
+    "models/utils.py",
+    "models/linear_attention_pdf.py",
+    "models/linear_attention_pdf_triton.py",
+    "models/linear_attention_pdf_triton_kernels.py",
+}
 
 class MSETrainer(Trainer):
     def compute_loss(
@@ -118,26 +122,29 @@ def main():
     )
     trainer.train()
     # Save and Convert
-    for layer in model.model.layers:
-        layer.self_attn = layer.self_attn.linear_attn
-    save_dir = Path(args.train.output_dir).absolute()
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    config = AutoConfig.from_pretrained(save_dir)
-    model_type = config.model_type
-    for key, value in settings[model_type].items():
-        setattr(config, key, value)
-    config.linear_attention_type = args.model.linear_attention_type
-    config.save_pretrained(save_dir)
-    current_dir = Path(__file__).resolve().parent.parent
-    for item in os.listdir(current_dir / remote_code_dirs[model_type]):
-        if not item.endswith(".py"):
-            continue
-        source_path = current_dir / remote_code_dirs[model_type] / item
-        target_path = save_dir / item
-        shutil.copy(source_path, target_path)
-    shutil.copy(current_dir / utils_file, save_dir / "utils.py")
-    print(f"Model saved to {save_dir}")
+    if trainer.is_world_process_zero():
+        for layer in model.model.layers:
+            layer.self_attn = layer.self_attn.linear_attn
+        save_dir = Path(args.train.output_dir).absolute()
+        model.save_pretrained(save_dir)
+        tokenizer.save_pretrained(save_dir)
+        config = AutoConfig.from_pretrained(save_dir)
+        model_type = config.model_type
+        for key, value in settings[model_type].items():
+            setattr(config, key, value)
+        config.linear_attention_type = args.model.linear_attention_type
+        config.save_pretrained(save_dir)
+        current_dir = Path(__file__).resolve().parent.parent
+        for item in os.listdir(current_dir / remote_code_dirs[model_type]):
+            if not item.endswith(".py"):
+                continue
+            source_path = current_dir / remote_code_dirs[model_type] / item
+            target_path = save_dir / item
+            shutil.copy(source_path, target_path)
+        for utils_file in utils_files:
+            file_name = utils_file.split("/")[-1]
+            shutil.copy(current_dir / utils_file, save_dir / file_name)
+        print(f"Model saved to {save_dir}")
 
 
 if __name__ == "__main__":
