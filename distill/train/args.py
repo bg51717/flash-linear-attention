@@ -7,7 +7,7 @@ class ModelArguments:
     )
     linear_attention_type: str = field(
         default="gated_deltanet",
-        metadata={"help": "Type of linear attention mechanism to use."}
+        metadata={"help": "Type of linear attention mechanism to use, e.g. gated_deltanet, delta_net, first_order_linear_attention, performer_linear_attention, performer_plus_linear_attention."}
     )
     teacher_model: str = field(
         default=None,

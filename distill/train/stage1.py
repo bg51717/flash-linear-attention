@@ -37,6 +37,10 @@ remote_code_dirs = {
 utils_files = {
     "models/utils.py",
     "models/linear_attention_pdf.py",
+    "models/linear_attention_performer.py",
+    "models/linear_attention_performer_triton.py",
+    "models/linear_attention_performer_plus.py",
+    "models/linear_attention_performer_plus_triton.py",
     "models/linear_attention_pdf_triton.py",
     "models/linear_attention_pdf_triton_kernels.py",
 }

@@ -1,12 +1,17 @@
-from fla.layers import gated_deltanet
+from fla.layers import delta_net, gated_deltanet
 import torch
 
 from .linear_attention_pdf import FirstOrderLinearAttention
+from .linear_attention_performer import PerformerLinearAttention
+from .linear_attention_performer_plus import PerformerPlusLinearAttention
 
 TYPE2ATTN = {
     "gated_deltanet": gated_deltanet.GatedDeltaNet,
+    "delta_net": delta_net.DeltaNet,
     "pdf_linear_attention": FirstOrderLinearAttention,
     "first_order_linear_attention": FirstOrderLinearAttention,
+    "performer_linear_attention": PerformerLinearAttention,
+    "performer_plus_linear_attention": PerformerPlusLinearAttention,
 }
 
 CONFIG2KWARGS = {
@@ -23,6 +28,22 @@ CONFIG2KWARGS = {
             >= cfg.num_attention_heads
             else cfg.num_attention_heads
         ),
+    },
+    "delta_net": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "mode": lambda cfg: getattr(cfg, "delta_net_mode", "chunk"),
+        "expand_k": lambda cfg: getattr(cfg, "expand_k", 1.0),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_beta": lambda cfg: getattr(cfg, "use_beta", True),
+        "use_gate": lambda cfg: getattr(cfg, "use_gate", False),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "allow_neg_eigval": lambda cfg: getattr(cfg, "allow_neg_eigval", False),
+        "qk_activation": lambda cfg: getattr(cfg, "qk_activation", "silu"),
+        "qk_norm": lambda cfg: getattr(cfg, "qk_norm", "l2"),
     },
     "pdf_linear_attention": {
         "hidden_size": "hidden_size",
@@ -59,6 +80,59 @@ CONFIG2KWARGS = {
         "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
         "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
         "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+    },
+    "performer_linear_attention": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_v_heads": lambda cfg: (
+            getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            if getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            >= cfg.num_attention_heads
+            else cfg.num_attention_heads
+        ),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "performer_nb_features": lambda cfg: getattr(cfg, "performer_nb_features", None),
+        "performer_feature_eps": lambda cfg: getattr(cfg, "performer_feature_eps", 1e-4),
+        "performer_ortho_scaling": lambda cfg: getattr(cfg, "performer_ortho_scaling", 0),
+        "performer_redraw_projection": lambda cfg: getattr(cfg, "performer_redraw_projection", False),
+        "performer_projection_seed": lambda cfg: getattr(cfg, "performer_projection_seed", 0),
+        "performer_use_triton": lambda cfg: getattr(cfg, "performer_use_triton", True),
+    },
+    "performer_plus_linear_attention": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_v_heads": lambda cfg: (
+            getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            if getattr(cfg, "num_key_value_heads", cfg.num_attention_heads)
+            >= cfg.num_attention_heads
+            else cfg.num_attention_heads
+        ),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "performer_nb_features": lambda cfg: getattr(cfg, "performer_nb_features", None),
+        "performer_feature_eps": lambda cfg: getattr(cfg, "performer_feature_eps", 1e-4),
+        "performer_ortho_scaling": lambda cfg: getattr(cfg, "performer_ortho_scaling", 0),
+        "performer_redraw_projection": lambda cfg: getattr(cfg, "performer_redraw_projection", False),
+        "performer_projection_seed": lambda cfg: getattr(cfg, "performer_projection_seed", 0),
+        "performer_use_triton": lambda cfg: getattr(cfg, "performer_use_triton", True),
+        "performer_antithetic_features": lambda cfg: getattr(cfg, "performer_antithetic_features", True),
+        "performer_qk_l2_norm": lambda cfg: getattr(cfg, "performer_qk_l2_norm", True),
+        "performer_use_decay": lambda cfg: getattr(cfg, "performer_use_decay", True),
+        "performer_decay_init": lambda cfg: getattr(cfg, "performer_decay_init", 2.0),
+        "performer_per_layer_projection": lambda cfg: getattr(cfg, "performer_per_layer_projection", True),
     },
 }
 
