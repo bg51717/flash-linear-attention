@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 try:
+    from fla.ops.delta_rule import fused_recurrent_delta_rule
+    from fla.ops.generalized_delta_rule import chunk_dplr_delta_rule
     from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla
 
     _TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover - runtime fallback
+    fused_recurrent_delta_rule = None
+    chunk_dplr_delta_rule = None
     fused_recurrent_simple_gla = None
     _TRITON_AVAILABLE = False
 
@@ -15,28 +20,67 @@ def performer_plus_causal_linear_attention_triton(
     q_prime: torch.Tensor,
     k_prime: torch.Tensor,
     v: torch.Tensor,
+    q_prime_den: torch.Tensor | None = None,
+    k_prime_den: torch.Tensor | None = None,
+    beta: torch.Tensor | None = None,
+    beta_den: torch.Tensor | None = None,
     log_decay: torch.Tensor | None = None,
     initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
+    update_rule: str = "sum",
     eps: float = 1e-6,
+    delta_denom_eps: float = 1e-3,
+    delta_smooth_denom: bool = False,
+    delta_denom_tau: float = 1e-2,
+    delta_log_decay: torch.Tensor | None = None,
+    delta_denominator_update: str = "delta",
+    delta_denominator_stopgrad: bool = False,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """
     Triton-backed causal Performer+ operator.
 
-    Recurrence:
+    Recurrence (`update_rule='sum'`):
         S_t = lambda_t * S_{t-1} + k'_t v_t^T
         z_t = lambda_t * z_{t-1} + k'_t
         o_t = (q'_t^T S_t) / (q'_t^T z_t + eps)
     where lambda_t = exp(log_decay_t) if `log_decay` is provided, otherwise 1.
 
+    Recurrence (`update_rule='delta'`):
+        S_t = S_{t-1} + beta_t * (v_t - S_{t-1} k'_t) k'_t^T
+        z_t = z_{t-1} + beta_t * (1 - z_{t-1} · k'_t) k'_t
+        o_t = (q'_t^T S_t) / (q'_t^T z_t + eps)
+
+    `q_prime_den` and `k_prime_den` optionally define a separate feature map for
+    denominator recurrence. When omitted, numerator maps are reused.
+
     This function launches Triton recurrent kernels for both numerator and
-    denominator recurrences via FLA fused recurrent simple GLA op.
+    denominator recurrences via FLA fused recurrent operators.
+    For `delta` update, denominator is sign-preserving clamped with
+    `delta_denom_eps` for stability.
     """
     if q_prime.ndim != 4 or k_prime.ndim != 4 or v.ndim != 4:
         raise ValueError("q_prime, k_prime, v must have shape [B, T, H, D].")
     if q_prime.shape[:3] != k_prime.shape[:3] or q_prime.shape[:3] != v.shape[:3]:
         raise ValueError("Leading dimensions of q_prime, k_prime, v must match.")
+    if q_prime_den is None:
+        q_prime_den = q_prime
+    if k_prime_den is None:
+        k_prime_den = k_prime
+    if q_prime_den.ndim != 4 or k_prime_den.ndim != 4:
+        raise ValueError("q_prime_den and k_prime_den must have shape [B, T, H, D].")
+    if q_prime_den.shape[:3] != q_prime.shape[:3] or k_prime_den.shape[:3] != q_prime.shape[:3]:
+        raise ValueError("Leading dimensions of denominator maps must match q_prime.")
+    if update_rule not in ("sum", "delta"):
+        raise ValueError(f"Unsupported update_rule={update_rule}. Expected one of ('sum', 'delta').")
+    if delta_denominator_update not in ("delta", "sum"):
+        raise ValueError(
+            f"Unsupported delta_denominator_update={delta_denominator_update}. Expected one of ('delta', 'sum').",
+        )
+    if delta_denom_eps <= 0:
+        raise ValueError(f"delta_denom_eps must be > 0, got {delta_denom_eps}.")
+    if delta_smooth_denom and delta_denom_tau <= 0:
+        raise ValueError(f"delta_denom_tau must be > 0 when delta_smooth_denom=True, got {delta_denom_tau}.")
     if log_decay is not None:
         if log_decay.ndim == 4 and log_decay.shape[-1] == 1:
             log_decay = log_decay.squeeze(-1)
@@ -44,17 +88,44 @@ def performer_plus_causal_linear_attention_triton(
             raise ValueError("log_decay must have shape [B, T, H] or [B, T, H, 1].")
         if log_decay.shape != q_prime.shape[:3]:
             raise ValueError("log_decay shape must match q_prime[:, :, :, 0].")
+    if delta_log_decay is not None:
+        if delta_log_decay.ndim == 4 and delta_log_decay.shape[-1] == 1:
+            delta_log_decay = delta_log_decay.squeeze(-1)
+        if delta_log_decay.ndim != 3:
+            raise ValueError("delta_log_decay must have shape [B, T, H] or [B, T, H, 1].")
+        if delta_log_decay.shape != q_prime.shape[:3]:
+            raise ValueError("delta_log_decay shape must match q_prime[:, :, :, 0].")
 
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Performer+ Triton operator is not available in current environment.")
-    if not (q_prime.is_cuda and k_prime.is_cuda and v.is_cuda):
+    if not (q_prime.is_cuda and k_prime.is_cuda and q_prime_den.is_cuda and k_prime_den.is_cuda and v.is_cuda):
         raise RuntimeError("Performer+ Triton operator requires CUDA tensors.")
 
     q_prime = q_prime.contiguous()
     k_prime = k_prime.contiguous()
+    q_prime_den = q_prime_den.contiguous()
+    k_prime_den = k_prime_den.contiguous()
     v = v.contiguous()
+    if beta is not None:
+        if beta.ndim == 4 and beta.shape[-1] == 1:
+            beta = beta.squeeze(-1)
+        if beta.ndim != 3:
+            raise ValueError("beta must have shape [B, T, H] or [B, T, H, 1].")
+        if beta.shape != q_prime.shape[:3]:
+            raise ValueError("beta shape must match q_prime[:, :, :, 0].")
+        beta = beta.contiguous().to(torch.float32)
+    if beta_den is not None:
+        if beta_den.ndim == 4 and beta_den.shape[-1] == 1:
+            beta_den = beta_den.squeeze(-1)
+        if beta_den.ndim != 3:
+            raise ValueError("beta_den must have shape [B, T, H] or [B, T, H, 1].")
+        if beta_den.shape != q_prime.shape[:3]:
+            raise ValueError("beta_den shape must match q_prime[:, :, :, 0].")
+        beta_den = beta_den.contiguous().to(torch.float32)
     if log_decay is not None:
         log_decay = log_decay.contiguous().to(torch.float32)
+    if delta_log_decay is not None:
+        delta_log_decay = delta_log_decay.contiguous().to(torch.float32)
 
     initial_state_kv = None
     initial_state_k = None
@@ -67,36 +138,172 @@ def performer_plus_causal_linear_attention_triton(
             raise ValueError("initial_state k_state must have shape [N, H, M].")
         if initial_state_kv.ndim != 4:
             raise ValueError("initial_state kv_state must have shape [N, H, M, V].")
-        if initial_state_kv.shape[:3] != initial_state_k.shape:
-            raise ValueError("initial_state kv_state and k_state leading dims must match.")
+        if initial_state_kv.shape[:2] != initial_state_k.shape[:2]:
+            raise ValueError("initial_state kv_state and k_state leading [N, H] dims must match.")
+        if initial_state_kv.shape[2] != k_prime.shape[-1]:
+            raise ValueError("initial_state kv_state feature size must match numerator key feature dim.")
+        if initial_state_k.shape[2] != k_prime_den.shape[-1]:
+            raise ValueError("initial_state k_state feature size must match denominator key feature dim.")
 
-    # Numerator recurrence: q'^T * S_t
-    num, kv_final = fused_recurrent_simple_gla(
-        q=q_prime,
-        k=k_prime,
-        v=v,
-        g=log_decay,
-        scale=1.0,
-        initial_state=initial_state_kv,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
+    if update_rule == "sum":
+        # Numerator recurrence: q'^T * S_t
+        num, kv_final = fused_recurrent_simple_gla(
+            q=q_prime,
+            k=k_prime,
+            v=v,
+            g=log_decay,
+            scale=1.0,
+            initial_state=initial_state_kv,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
 
-    # Denominator recurrence: q'^T * z_t, implemented as value-dim=1 recurrence.
-    ones = torch.ones((*v.shape[:3], 1), device=v.device, dtype=v.dtype)
-    den_init = None if initial_state_k is None else initial_state_k.unsqueeze(-1)
-    den, z_final = fused_recurrent_simple_gla(
-        q=q_prime,
-        k=k_prime,
-        v=ones,
-        g=log_decay,
-        scale=1.0,
-        initial_state=den_init,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-    )
+        # Denominator recurrence: q'^T * z_t, implemented as value-dim=1 recurrence.
+        ones = torch.ones((*v.shape[:3], 1), device=v.device, dtype=v.dtype)
+        den_init = None if initial_state_k is None else initial_state_k.unsqueeze(-1)
+        den, z_final = fused_recurrent_simple_gla(
+            q=q_prime_den,
+            k=k_prime_den,
+            v=ones,
+            g=log_decay,
+            scale=1.0,
+            initial_state=den_init,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+    else:
+        if log_decay is not None:
+            raise ValueError("log_decay is only supported with update_rule='sum'.")
+        if beta is None:
+            beta = torch.ones_like(q_prime[..., 0], dtype=torch.float32)
+        if beta_den is None:
+            beta_den = beta
 
-    out = num.to(torch.float32) / (den.to(torch.float32) + eps)
+        use_dplr_leaky = (
+            delta_log_decay is not None
+            and q_prime.shape[-1] >= 16
+            and q_prime_den.shape[-1] >= 16
+            and v.shape[-1] >= 16
+        )
+        if not use_dplr_leaky:
+            num, kv_final = fused_recurrent_delta_rule(
+                q=q_prime,
+                k=k_prime,
+                v=v,
+                beta=beta,
+                scale=1.0,
+                initial_state=initial_state_kv,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=False,
+            )
+
+            ones = torch.ones((*v.shape[:3], 1), device=v.device, dtype=v.dtype)
+            den_init = None if initial_state_k is None else initial_state_k.unsqueeze(-1)
+            if delta_denominator_update == "delta":
+                den, z_final = fused_recurrent_delta_rule(
+                    q=q_prime_den,
+                    k=k_prime_den,
+                    v=ones,
+                    beta=beta_den,
+                    scale=1.0,
+                    initial_state=den_init,
+                    output_final_state=output_final_state,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=False,
+                )
+            else:
+                den, z_final = fused_recurrent_simple_gla(
+                    q=q_prime_den,
+                    k=k_prime_den,
+                    v=ones,
+                    g=None,
+                    scale=1.0,
+                    initial_state=den_init,
+                    output_final_state=output_final_state,
+                    cu_seqlens=cu_seqlens,
+                )
+        else:
+            if chunk_dplr_delta_rule is None:
+                raise RuntimeError(
+                    "delta_log_decay was provided but chunk_dplr_delta_rule is unavailable.",
+                )
+            beta_t = beta.to(q_prime.dtype).unsqueeze(-1)
+
+            # Leaky delta as a DPLR recurrence:
+            #   S_t = lambda_t S_{t-1} + beta_t (v_t - S_{t-1} k_t) k_t^T
+            # by choosing:
+            #   a_t = -beta_t k_t, b_t = k_t, v'_t = beta_t v_t, gk_t = log(lambda_t).
+            a_num = -beta_t * k_prime
+            b_num = k_prime
+            v_num = v * beta_t
+            gk_num = delta_log_decay.to(q_prime.dtype).unsqueeze(-1).expand_as(k_prime)
+
+            num, kv_final = chunk_dplr_delta_rule(
+                q=q_prime,
+                k=k_prime,
+                v=v_num,
+                a=a_num,
+                b=b_num,
+                gk=gk_num,
+                scale=1.0,
+                initial_state=initial_state_kv,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+            )
+
+            # Keep denominator on fused kernels (value-dim=1 is not currently
+            # robust on the DPLR chunk path across all shapes).
+            ones = torch.ones((*v.shape[:3], 1), device=v.device, dtype=v.dtype)
+            den_init = None if initial_state_k is None else initial_state_k.unsqueeze(-1)
+            if delta_denominator_update == "delta":
+                den, z_final = fused_recurrent_delta_rule(
+                    q=q_prime_den,
+                    k=k_prime_den,
+                    v=ones,
+                    beta=beta_den,
+                    scale=1.0,
+                    initial_state=den_init,
+                    output_final_state=output_final_state,
+                    cu_seqlens=cu_seqlens,
+                    use_qk_l2norm_in_kernel=False,
+                )
+            else:
+                den, z_final = fused_recurrent_simple_gla(
+                    q=q_prime_den,
+                    k=k_prime_den,
+                    v=ones,
+                    g=delta_log_decay,
+                    scale=1.0,
+                    initial_state=den_init,
+                    output_final_state=output_final_state,
+                    cu_seqlens=cu_seqlens,
+                )
+
+    num32 = num.to(torch.float32)
+    den32 = den.to(torch.float32)
+    if update_rule == "delta" and delta_denominator_update == "delta":
+        # Delta update does not guarantee strictly positive denominator; protect
+        # against tiny values that cause gradient explosions.
+        #
+        # Optional smooth barrier:
+        #   |d|_safe = softplus(|d| / tau) * tau
+        # provides a differentiable alternative to hard clamping and reduces
+        # gradient spikes around |d| ~= delta_denom_eps.
+        den_sign = torch.where(den32 >= 0, torch.ones_like(den32), -torch.ones_like(den32))
+        den_abs = den32.abs()
+        if delta_smooth_denom:
+            den_abs = F.softplus(den_abs / float(delta_denom_tau)) * float(delta_denom_tau)
+        den_safe = den_sign * den_abs.clamp_min(float(delta_denom_eps))
+        out = num32 / den_safe
+    elif update_rule == "delta" and delta_denominator_update == "sum":
+        # Sum-denominator path is positive by construction; still keep a floor
+        # to avoid large ratio spikes when the accumulated mass is tiny.
+        den_used = den32.detach() if delta_denominator_stopgrad else den32
+        den_safe = den_used.clamp_min(float(delta_denom_eps))
+        out = num32 / den_safe
+    else:
+        out = num32 / (den32 + eps)
     final_state = None
     if output_final_state:
         final_state = (kv_final, z_final.squeeze(-1).to(torch.float32))

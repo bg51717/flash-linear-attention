@@ -2,6 +2,7 @@ import transformers
 from dataclasses import dataclass
 from datasets import load_dataset
 import warnings
+import os
 
 def preprocess_function(examples, tokenizer, seq_len):
     model_inputs = {"input_ids": [[]]}
@@ -87,12 +88,19 @@ class DataCollatorWithFlattening(transformers.DefaultDataCollator):
 
 def prapare_dataset(tokenizer, data_args, split="train"):
     dataset = load_dataset(data_args.dataset_name, split=split)
+    debug_max_examples = int(os.environ.get("DISTILL_DATA_DEBUG_MAX_EXAMPLES", "0"))
+    if debug_max_examples > 0:
+        keep = min(debug_max_examples, len(dataset))
+        dataset = dataset.select(range(keep))
+    num_proc = int(os.environ.get("DISTILL_DATA_NUM_PROC", "128"))
+    if num_proc < 1:
+        num_proc = 1
     processed_dataset = dataset.map(
         preprocess_function,
         batched=True,
         batch_size=1024,
         remove_columns=dataset.column_names,
-        num_proc=128,
+        num_proc=num_proc,
         fn_kwargs={"tokenizer": tokenizer, "seq_len": data_args.seq_len},
     )
     return processed_dataset

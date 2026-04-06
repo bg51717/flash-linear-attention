@@ -1,0 +1,570 @@
+from __future__ import annotations
+
+import math
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, repeat
+
+from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
+from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
+from fla.ops.utils.index import prepare_lens_from_mask
+
+try:
+    from .linear_attention_pdf_final_triton import (
+        _TRITON_AVAILABLE as _PDF_FINAL_TRITON_AVAILABLE,
+        pdf_final_linear_attention_triton,
+    )
+except Exception:  # pragma: no cover
+    _PDF_FINAL_TRITON_AVAILABLE = False
+    pdf_final_linear_attention_triton = None
+
+if TYPE_CHECKING:
+    from transformers.processing_utils import Unpack
+
+    from fla.models.utils import Cache
+
+
+def _prepare_initial_state(
+    q: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: tuple[torch.Tensor, ...] | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    n, _, k_dim = q.shape
+    v_dim = v.shape[-1]
+    device = q.device
+    dtype = torch.float32
+
+    if initial_state is None:
+        s_sum = torch.zeros((n, v_dim, k_dim), device=device, dtype=dtype)
+        k_sum = torch.zeros((n, k_dim), device=device, dtype=dtype)
+        o_prev = torch.zeros((n, v_dim), device=device, dtype=dtype)
+        q_prev = torch.zeros((n, k_dim), device=device, dtype=dtype)
+        count = torch.zeros((n,), device=device, dtype=dtype)
+        return s_sum, k_sum, o_prev, q_prev, count
+
+    if len(initial_state) != 5:
+        raise ValueError(
+            "initial_state must be a 5-tuple: (s_sum, k_sum, o_prev, q_prev, count).",
+        )
+
+    s_sum, k_sum, o_prev, q_prev, count = initial_state
+    s_sum = s_sum.reshape(n, v_dim, k_dim).to(device=device, dtype=dtype).contiguous()
+    k_sum = k_sum.reshape(n, k_dim).to(device=device, dtype=dtype).contiguous()
+    o_prev = o_prev.reshape(n, v_dim).to(device=device, dtype=dtype).contiguous()
+    q_prev = q_prev.reshape(n, k_dim).to(device=device, dtype=dtype).contiguous()
+    count = count.reshape(n).to(device=device, dtype=dtype).contiguous()
+    return s_sum, k_sum, o_prev, q_prev, count
+
+
+def _torch_pdf_final_linear_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: tuple[torch.Tensor, ...] | None = None,
+    output_final_state: bool = False,
+    hist_eps: float = 1e-4,
+    score_clip: float = 20.0,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
+    n, t, _ = q.shape
+    qf = q.float()
+    kf = k.float()
+    vf = v.float()
+
+    s_sum, k_sum, o_prev, q_prev, count = _prepare_initial_state(qf, vf, initial_state)
+    out = torch.empty((n, t, vf.shape[-1]), device=q.device, dtype=torch.float32)
+
+    beta_mean_sum = 0.0
+    hist_neg_sum = 0.0
+    hist_min = float("inf")
+
+    for i in range(t):
+        q_i = qf[:, i]
+        k_i = kf[:, i]
+        v_i = vf[:, i]
+
+        valid_hist = count > 0
+        o_hist = torch.zeros_like(o_prev)
+        beta = torch.ones_like(count)
+        hist_mass = torch.zeros_like(count)
+
+        if valid_hist.any():
+            inv_count = torch.zeros_like(count)
+            inv_count[valid_hist] = count[valid_hist].reciprocal()
+            s_mean = s_sum * inv_count[:, None, None]
+            k_mean = k_sum * inv_count[:, None]
+            dq = q_i - q_prev
+
+            history_delta = torch.einsum("nvk,nk->nv", s_mean, dq)
+            history_delta = history_delta - o_prev * torch.sum(k_mean * dq, dim=-1, keepdim=True)
+            o_hist = o_prev + history_delta
+
+            hist_mass = torch.sum(k_sum * q_i, dim=-1)
+            score = torch.sum(k_i * q_i, dim=-1).clamp(min=-score_clip, max=score_clip)
+            hist_log = torch.log(F.softplus(hist_mass) + hist_eps)
+            beta_hist = torch.sigmoid(score - hist_log)
+            beta = torch.where(valid_hist, beta_hist, beta)
+
+        o_i = (1.0 - beta[:, None]) * o_hist + beta[:, None] * v_i
+        out[:, i] = o_i
+
+        s_sum = s_sum + torch.einsum("nv,nk->nvk", v_i, k_i)
+        k_sum = k_sum + k_i
+        o_prev = o_i
+        q_prev = q_i
+        count = count + 1.0
+
+        beta_mean_sum += float(beta.mean().item())
+        hist_neg_sum += float((hist_mass < 0).float().mean().item())
+        hist_min = min(hist_min, float(hist_mass.min().item()))
+
+    final_state = (s_sum, k_sum, o_prev, q_prev, count) if output_final_state else None
+    stats = {
+        "pdf_final_beta_mean": beta_mean_sum / max(t, 1),
+        "pdf_final_hist_neg_frac": hist_neg_sum / max(t, 1),
+        "pdf_final_hist_min": hist_min if t > 0 else 0.0,
+    }
+    return out.to(q.dtype), final_state, stats
+
+
+def _flatten_initial_state(
+    initial_state: tuple[torch.Tensor, ...] | None,
+    batch: int,
+    heads: int,
+    v_dim: int,
+    k_dim: int,
+) -> tuple[torch.Tensor, ...] | None:
+    if initial_state is None:
+        return None
+    s_sum, k_sum, o_prev, q_prev, count = initial_state
+    return (
+        s_sum.reshape(batch * heads, v_dim, k_dim).contiguous(),
+        k_sum.reshape(batch * heads, k_dim).contiguous(),
+        o_prev.reshape(batch * heads, v_dim).contiguous(),
+        q_prev.reshape(batch * heads, k_dim).contiguous(),
+        count.reshape(batch * heads).contiguous(),
+    )
+
+
+def _reshape_final_state(
+    final_state: tuple[torch.Tensor, ...],
+    out_batch: int,
+    n_heads: int,
+    v_dim: int,
+    k_dim: int,
+) -> tuple[torch.Tensor, ...]:
+    s_sum, k_sum, o_prev, q_prev, count = final_state
+    return (
+        s_sum.reshape(out_batch, n_heads, v_dim, k_dim).contiguous(),
+        k_sum.reshape(out_batch, n_heads, k_dim).contiguous(),
+        o_prev.reshape(out_batch, n_heads, v_dim).contiguous(),
+        q_prev.reshape(out_batch, n_heads, k_dim).contiguous(),
+        count.reshape(out_batch, n_heads).contiguous(),
+    )
+
+
+def _run_varlen(
+    qf: torch.Tensor,
+    kf: torch.Tensor,
+    vf: torch.Tensor,
+    n_heads: int,
+    k_dim: int,
+    v_dim: int,
+    cu_seqlens: torch.LongTensor,
+    initial_state: tuple[torch.Tensor, ...] | None,
+    output_final_state: bool,
+    hist_eps: float,
+    score_clip: float,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None, dict[str, float]]:
+    n_seq = cu_seqlens.numel() - 1
+    cu = cu_seqlens.tolist()
+
+    if initial_state is not None:
+        s_sum0, k_sum0, o_prev0, q_prev0, count0 = initial_state
+        init_flat = (
+            s_sum0.reshape(n_seq, n_heads, v_dim, k_dim).contiguous(),
+            k_sum0.reshape(n_seq, n_heads, k_dim).contiguous(),
+            o_prev0.reshape(n_seq, n_heads, v_dim).contiguous(),
+            q_prev0.reshape(n_seq, n_heads, k_dim).contiguous(),
+            count0.reshape(n_seq, n_heads).contiguous(),
+        )
+    else:
+        init_flat = None
+
+    out = torch.empty_like(vf)
+    final_chunks = [[], [], [], [], []] if output_final_state else None
+    stats_beta = []
+    stats_hist_neg = []
+    stats_hist_min = []
+
+    for i in range(n_seq):
+        bos, eos = int(cu[i]), int(cu[i + 1])
+        seg_len = eos - bos
+        if seg_len < 0:
+            raise ValueError("`cu_seqlens` must be non-decreasing.")
+
+        if init_flat is None:
+            init_seg = None
+        else:
+            init_seg = (
+                init_flat[0][i].contiguous(),
+                init_flat[1][i].contiguous(),
+                init_flat[2][i].contiguous(),
+                init_flat[3][i].contiguous(),
+                init_flat[4][i].contiguous(),
+            )
+
+        if seg_len == 0:
+            if output_final_state:
+                if init_seg is None:
+                    end_seg = (
+                        torch.zeros((n_heads, v_dim, k_dim), device=qf.device, dtype=torch.float32),
+                        torch.zeros((n_heads, k_dim), device=qf.device, dtype=torch.float32),
+                        torch.zeros((n_heads, v_dim), device=qf.device, dtype=torch.float32),
+                        torch.zeros((n_heads, k_dim), device=qf.device, dtype=torch.float32),
+                        torch.zeros((n_heads,), device=qf.device, dtype=torch.float32),
+                    )
+                else:
+                    end_seg = init_seg
+                for idx in range(5):
+                    final_chunks[idx].append(end_seg[idx])
+            continue
+
+        out_seg, st_seg, stats_seg = _torch_pdf_final_linear_attention(
+            qf[:, bos:eos, :],
+            kf[:, bos:eos, :],
+            vf[:, bos:eos, :],
+            initial_state=init_seg,
+            output_final_state=output_final_state,
+            hist_eps=hist_eps,
+            score_clip=score_clip,
+        )
+        out[:, bos:eos, :] = out_seg
+        stats_beta.append(stats_seg["pdf_final_beta_mean"])
+        stats_hist_neg.append(stats_seg["pdf_final_hist_neg_frac"])
+        stats_hist_min.append(stats_seg["pdf_final_hist_min"])
+
+        if output_final_state:
+            for idx in range(5):
+                final_chunks[idx].append(st_seg[idx])
+
+    final_state = tuple(torch.stack(chunks, dim=0) for chunks in final_chunks) if output_final_state else None
+    stats = {
+        "pdf_final_beta_mean": float(sum(stats_beta) / max(len(stats_beta), 1)),
+        "pdf_final_hist_neg_frac": float(sum(stats_hist_neg) / max(len(stats_hist_neg), 1)),
+        "pdf_final_hist_min": float(min(stats_hist_min)) if stats_hist_min else 0.0,
+    }
+    return out, final_state, stats
+
+
+def pdf_final_linear_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    initial_state: tuple[torch.Tensor, ...] | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    hist_eps: float = 1e-4,
+    score_clip: float = 20.0,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None, dict[str, float]]:
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q, k, v must have shape [B, T, H, D].")
+
+    batch, seqlen, n_heads, k_dim = q.shape
+    v_dim = v.shape[-1]
+    if k.shape[:3] != (batch, seqlen, n_heads):
+        raise ValueError("q and k must share [B, T, H].")
+    if v.shape[:3] != (batch, seqlen, n_heads):
+        raise ValueError("q and v must share [B, T, H].")
+
+    qf = q.permute(0, 2, 1, 3).contiguous().reshape(batch * n_heads, seqlen, k_dim)
+    kf = k.permute(0, 2, 1, 3).contiguous().reshape(batch * n_heads, seqlen, k_dim)
+    vf = v.permute(0, 2, 1, 3).contiguous().reshape(batch * n_heads, seqlen, v_dim)
+
+    init_flat = _flatten_initial_state(initial_state, batch, n_heads, v_dim, k_dim)
+    if cu_seqlens is None:
+        out_flat, final_flat, stats = _torch_pdf_final_linear_attention(
+            qf,
+            kf,
+            vf,
+            initial_state=init_flat,
+            output_final_state=output_final_state,
+            hist_eps=hist_eps,
+            score_clip=score_clip,
+        )
+    else:
+        out_flat, final_flat, stats = _run_varlen(
+            qf,
+            kf,
+            vf,
+            n_heads=n_heads,
+            k_dim=k_dim,
+            v_dim=v_dim,
+            cu_seqlens=cu_seqlens,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            hist_eps=hist_eps,
+            score_clip=score_clip,
+        )
+
+    out = out_flat.reshape(batch, n_heads, seqlen, v_dim).permute(0, 2, 1, 3).contiguous()
+    final_state = (
+        _reshape_final_state(final_flat, cu_seqlens.numel() - 1 if cu_seqlens is not None else batch, n_heads, v_dim, k_dim)
+        if output_final_state
+        else None
+    )
+    return out, final_state, stats
+
+
+class PDFFinalLinearAttention(nn.Module):
+    """
+    Implements the final simplified recurrence proposed at the end of
+    `Approximating Self-attention.pdf`.
+
+    The paper writes the history states as running means `S_i, K_i`. For
+    chunked/sequence-parallel execution we keep the composable sum states
+
+        S_sum_i = sum_{j<=i} v_j k_j^T
+        K_sum_i = sum_{j<=i} k_j
+        count_i = i
+
+    and recover the paper's averages on the fly:
+
+        S_i = S_sum_i / count_i
+        K_i = K_sum_i / count_i
+
+    This makes the recurrence resumable across chunk boundaries using the final
+    state `(S_sum, K_sum, o_prev, q_prev, count)`.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 2048,
+        expand_v: float = 1.0,
+        head_dim: int = 128,
+        num_heads: int = 8,
+        num_kv_heads: int | None = None,
+        use_short_conv: bool = True,
+        conv_size: int = 4,
+        conv_bias: bool = False,
+        layer_idx: int | None = None,
+        norm_eps: float = 1e-5,
+        output_norm: str = "identity",
+        qkv_bias: bool = False,
+        rope_theta: float = 10000.0,
+        max_position_embeddings: int | None = None,
+        hist_eps: float = 1e-4,
+        score_clip: float = 20.0,
+        use_triton: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        del kwargs
+
+        self.hidden_size = hidden_size
+        self.expand_v = expand_v
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.use_short_conv = use_short_conv
+        self.conv_size = conv_size
+        self.conv_bias = conv_bias
+        self.layer_idx = layer_idx
+        self.hist_eps = hist_eps
+        self.score_clip = score_clip
+        self.use_triton = use_triton
+        self.max_position_embeddings = max_position_embeddings
+
+        self.head_k_dim = head_dim
+        self.head_v_dim = int(head_dim * expand_v)
+        self.key_dim = self.num_heads * self.head_k_dim
+        self.kv_key_dim = self.num_kv_heads * self.head_k_dim
+        self.kv_value_dim = self.num_kv_heads * self.head_v_dim
+        self.value_dim = self.num_heads * self.head_v_dim
+        self.qk_scale = self.head_k_dim ** -0.25
+
+        if self.num_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"num_heads={self.num_heads} must be divisible by num_kv_heads={self.num_kv_heads}.",
+            )
+        if not math.isclose(self.head_v_dim, head_dim * expand_v, rel_tol=1e-5):
+            raise ValueError(
+                f"expand_v={expand_v} does not produce integer head_v_dim for head_dim={head_dim}.",
+            )
+
+        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(hidden_size, self.kv_key_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(hidden_size, self.kv_value_dim, bias=qkv_bias)
+
+        if use_short_conv:
+            self.q_conv1d = ShortConvolution(
+                hidden_size=self.key_dim,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation="silu",
+            )
+            self.k_conv1d = ShortConvolution(
+                hidden_size=self.kv_key_dim,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation="silu",
+            )
+            self.v_conv1d = ShortConvolution(
+                hidden_size=self.kv_value_dim,
+                kernel_size=conv_size,
+                bias=conv_bias,
+                activation="silu",
+            )
+
+        if output_norm == "rmsnorm":
+            self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
+        elif output_norm == "identity":
+            self.o_norm = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported output_norm `{output_norm}`.")
+        self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+        self.rotary = RotaryEmbedding(dim=self.head_k_dim, base=rope_theta)
+        self.last_error_stats: dict[str, float] = {}
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs: Unpack[dict],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        del output_attentions
+
+        if attention_mask is not None and attention_mask.ndim != 2:
+            raise ValueError("attention_mask must have shape [batch_size, seq_len].")
+
+        batch_size, q_len, _ = hidden_states.shape
+        last_state = None
+        if past_key_values is not None and self.layer_idx is not None and len(past_key_values) > self.layer_idx:
+            last_state = past_key_values[self.layer_idx]
+
+        recurrent_state = last_state["recurrent_state"] if last_state is not None else None
+
+        cu_seqlens = kwargs.get("cu_seqlens")
+        indices = None
+        max_seqlen = q_len
+        seqlen_offset = 0
+        if attention_mask is not None and past_key_values is None:
+            indices, cu_seqlens, max_seqlen = get_unpad_data(attention_mask[:, -q_len:])
+            hidden_states = index_first_axis(
+                rearrange(hidden_states, "b t d -> (b t) d"),
+                indices,
+            ).unsqueeze(0)
+            max_seqlen = max(max_seqlen, hidden_states.shape[1])
+        elif past_key_values is not None:
+            seqlen_offset = past_key_values.get_seq_length(self.layer_idx)
+            max_seqlen = q_len + seqlen_offset
+            if attention_mask is not None:
+                seqlen_offset = seqlen_offset + prepare_lens_from_mask(attention_mask) - attention_mask.shape[-1]
+                max_seqlen = q_len + int(max(seqlen_offset).item())
+        if self.max_position_embeddings is not None:
+            max_seqlen = max(max_seqlen, self.max_position_embeddings)
+
+        if self.use_short_conv:
+            conv_state_q, conv_state_k, conv_state_v = None, None, None
+            if last_state is not None:
+                conv_state_q, conv_state_k, conv_state_v = last_state["conv_state"]
+            q, conv_state_q = self.q_conv1d(
+                x=self.q_proj(hidden_states),
+                cache=conv_state_q,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            k, conv_state_k = self.k_conv1d(
+                x=self.k_proj(hidden_states),
+                cache=conv_state_k,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+            v, conv_state_v = self.v_conv1d(
+                x=self.v_proj(hidden_states),
+                cache=conv_state_v,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+            )
+        else:
+            q = F.silu(self.q_proj(hidden_states))
+            k = F.silu(self.k_proj(hidden_states))
+            v = F.silu(self.v_proj(hidden_states))
+            conv_state_q, conv_state_k, conv_state_v = None, None, None
+
+        q = rearrange(q, "b t (h d) -> b t h d", d=self.head_k_dim)
+        k = rearrange(k, "b t (h d) -> b t h d", d=self.head_k_dim)
+        v = rearrange(v, "b t (h d) -> b t h d", d=self.head_v_dim)
+
+        q, k = self.rotary(
+            q,
+            k,
+            seqlen_offset=seqlen_offset,
+            max_seqlen=max_seqlen,
+            cu_seqlens=cu_seqlens,
+        )
+        q = q * self.qk_scale
+        k = k * self.qk_scale
+
+        if self.num_kv_groups > 1:
+            k = repeat(k, "b t h d -> b t (h g) d", g=self.num_kv_groups)
+            v = repeat(v, "b t h d -> b t (h g) d", g=self.num_kv_groups)
+
+        use_triton_path = bool(
+            self.use_triton
+            and _PDF_FINAL_TRITON_AVAILABLE
+            and q.is_cuda
+            and recurrent_state is None
+            and not bool(use_cache)
+        )
+        if use_triton_path:
+            o, recurrent_state, stats = pdf_final_linear_attention_triton(
+                q=q,
+                k=k,
+                v=v,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+                hist_eps=self.hist_eps,
+                score_clip=self.score_clip,
+            )
+        else:
+            o, recurrent_state, stats = pdf_final_linear_attention(
+                q=q,
+                k=k,
+                v=v,
+                initial_state=recurrent_state,
+                output_final_state=bool(use_cache),
+                cu_seqlens=cu_seqlens,
+                hist_eps=self.hist_eps,
+                score_clip=self.score_clip,
+            )
+        self.last_error_stats = stats
+
+        if past_key_values is not None and self.layer_idx is not None:
+            past_key_values.update(
+                recurrent_state=recurrent_state,
+                conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
+                layer_idx=self.layer_idx,
+                offset=q_len,
+            )
+
+        o = self.o_norm(o)
+        o = rearrange(o, "b t h d -> b t (h d)")
+        o = self.o_proj(o)
+        if indices is not None:
+            o = pad_input(o.squeeze(0), indices, batch_size, q_len)
+
+        return o, None, past_key_values
+
+
+__all__ = [
+    "PDFFinalLinearAttention",
+    "pdf_final_linear_attention",
+    "_torch_pdf_final_linear_attention",
+]
