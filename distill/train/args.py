@@ -150,7 +150,7 @@ class ModelArguments:
         metadata={"help": "Upper clip applied to control-variate exp exponent for Performer+ stability."}
     )
     performer_enable_error_observability: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Enable Performer+ approximation-error observability metrics in forward pass."}
     )
     performer_error_observe_interval: int = field(
@@ -191,7 +191,7 @@ class ModelArguments:
     )
     performer_state_update: str = field(
         default="sum",
-        metadata={"help": "Performer+ state update rule: 'sum' or 'delta'."}
+        metadata={"help": "Performer+ state update rule: 'sum', 'delta', or 'pdf_delta'/'overwrite' (PDF delta rule from performer+delta.pdf)."}
     )
     performer_use_beta: bool = field(
         default=False,

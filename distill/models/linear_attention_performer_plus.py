@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
+from fla.modules.l2norm import l2norm_fwd
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 
 from .linear_attention_performer import (
@@ -22,11 +23,17 @@ from .linear_attention_performer_plus_triton import (
 from .linear_attention_performer_plus_triton import (
     performer_plus_causal_linear_attention_triton,
 )
+from .linear_attention_performer_plus_triton import (
+    performer_plus_pdf_delta_attention_triton,
+)
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
     from fla.models.utils import Cache
+
+
+_PDF_DELTA_STATE_UPDATES = {"pdf_delta", "overwrite"}
 
 
 def _build_antithetic_orthogonal_random_matrix(
@@ -504,12 +511,228 @@ def _performer_positive_linear_feature_map(
     return torch.cat([const, x_proj / c_sqrt], dim=-1)
 
 
+def _performer_shared_softmax_feature_map(
+    x: torch.Tensor,
+    projection_matrix: torch.Tensor,
+    *,
+    eps: float,
+) -> torch.Tensor:
+    """
+    Symmetric FAVOR+ positive feature map used by the PDF delta update.
+
+    Unlike the standard Performer query/key pair, this map uses the same
+    per-token stabilizer for both q and k so the PDF delta derivation can treat
+    `phi(x)` consistently when the stored key is queried again.
+    """
+    x = x.to(torch.float32)
+    projection_matrix = projection_matrix.to(torch.float32)
+
+    data_normalizer = x.shape[-1] ** -0.25
+    x = x * data_normalizer
+    ratio = projection_matrix.shape[1] ** -0.5
+
+    data_dash = torch.einsum('bthd,hmd->bthm', x, projection_matrix)
+    diag_data = 0.5 * x.square().sum(dim=-1, keepdim=True)
+    stabilizer = data_dash.amax(dim=-1, keepdim=True)
+    return ratio * (torch.exp(data_dash - diag_data - stabilizer) + eps)
+
+
+def performer_plus_pdf_delta_attention(
+    q_prime: torch.Tensor,
+    k_prime: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    q_prime_den: torch.Tensor | None = None,
+    k_prime_den: torch.Tensor | None = None,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """
+    Performer+ delta update inspired by `performer+delta.pdf`.
+
+    The updated PDF defines an intermediate state via one standard Performer
+    update that writes the negative current output at the current key:
+
+        S_t^- = Update_perf(S_{t-1}, k_t, -Output_perf(S_{t-1}, k_t))
+
+    followed by a normal Performer write with `v_t`. With shared positive
+    features `phi_t = phi(k_t)` and `psi_t = phi(q_t)`, this yields:
+
+        W_t = W_{t-1}
+              - (W_{t-1} phi_t / (z_{t-1}^T phi_t)) phi_t^T
+              + v_t phi_t^T
+        z_t = z_{t-1} + 2 phi_t
+
+    In the transposed state layout used here, `kv_state` has shape [N, H, M, V]
+    and stores W^T. The recurrence is:
+
+        y_t = kv_state_{t-1}^T phi_t
+        d_t = z_{t-1}^T phi_t
+        o_t^- = y_t / d_t
+        kv_state_t = kv_state_{t-1} + phi_t (v_t - o_t^-)^T
+        z_t = z_{t-1} + 2 phi_t
+        o_t = kv_state_t^T psi_t / (z_t^T psi_t + eps)
+    """
+    if q_prime.ndim != 4 or k_prime.ndim != 4 or v.ndim != 4:
+        raise ValueError("q_prime, k_prime, v must have shape [B, T, H, D].")
+    if q_prime.shape[:3] != k_prime.shape[:3] or q_prime.shape[:3] != v.shape[:3]:
+        raise ValueError("Leading dimensions of q_prime, k_prime, v must match.")
+    if q_prime_den is None:
+        q_prime_den = q_prime
+    if k_prime_den is None:
+        k_prime_den = k_prime
+    if q_prime_den.ndim != 4 or k_prime_den.ndim != 4:
+        raise ValueError("q_prime_den and k_prime_den must have shape [B, T, H, D].")
+    if q_prime_den.shape[:3] != q_prime.shape[:3] or k_prime_den.shape[:3] != q_prime.shape[:3]:
+        raise ValueError("Leading dimensions of denominator maps must match q_prime.")
+    if eps <= 0:
+        raise ValueError(f"eps must be > 0, got {eps}.")
+
+    q_num = q_prime.float()
+    k_num = k_prime.float()
+    q_den = q_prime_den.float()
+    k_den = k_prime_den.float()
+    v32 = v.float()
+
+    feature_dim = k_num.shape[-1]
+    den_feature_dim = k_den.shape[-1]
+    value_dim = v32.shape[-1]
+
+    def _run_segment(
+        q_seg: torch.Tensor,
+        k_seg: torch.Tensor,
+        v_seg: torch.Tensor,
+        q_den_seg: torch.Tensor,
+        k_den_seg: torch.Tensor,
+        kv_state: torch.Tensor,
+        z_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        outs: list[torch.Tensor] = []
+        for t in range(q_seg.shape[1]):
+            phi_num = k_seg[:, t]
+            phi_den = k_den_seg[:, t]
+            psi_num = q_seg[:, t]
+            psi_den = q_den_seg[:, t]
+            value_t = v_seg[:, t]
+
+            current_num_at_key = torch.einsum('nhmv,nhm->nhv', kv_state, phi_num)
+            current_den_at_key = (z_state * phi_den).sum(dim=-1, keepdim=True).clamp_min(float(eps))
+            current_output_at_key = current_num_at_key / current_den_at_key
+            delta_value = value_t - current_output_at_key
+
+            kv_state = kv_state + torch.einsum(
+                'nhm,nhv->nhmv',
+                phi_num,
+                delta_value,
+            )
+            z_state = z_state + 2.0 * phi_den
+
+            num_t = torch.einsum('nhmv,nhm->nhv', kv_state, psi_num)
+            den_t = (z_state * psi_den).sum(dim=-1, keepdim=True).clamp_min(float(eps))
+            outs.append((num_t / den_t).to(v.dtype))
+
+        return torch.stack(outs, dim=1), kv_state, z_state
+
+    if cu_seqlens is None:
+        batch = q_num.shape[0]
+        if initial_state is None:
+            kv_state = torch.zeros(
+                batch,
+                q_num.shape[2],
+                feature_dim,
+                value_dim,
+                device=q_num.device,
+                dtype=torch.float32,
+            )
+            z_state = torch.zeros(
+                batch,
+                q_num.shape[2],
+                den_feature_dim,
+                device=q_num.device,
+                dtype=torch.float32,
+            )
+        else:
+            kv_state, z_state = initial_state
+            kv_state = kv_state.contiguous().float()
+            z_state = z_state.contiguous().float()
+            if kv_state.shape != (batch, q_num.shape[2], feature_dim, value_dim):
+                raise ValueError("initial_state kv_state shape does not match dense input.")
+            if z_state.shape != (batch, q_num.shape[2], den_feature_dim):
+                raise ValueError("initial_state k_state shape does not match dense input.")
+        out, kv_state, z_state = _run_segment(q_num, k_num, v32, q_den, k_den, kv_state, z_state)
+        final_state = (kv_state, z_state) if output_final_state else None
+        return out, final_state
+
+    if q_num.shape[0] != 1:
+        raise ValueError("Packed varlen mode expects q_prime batch dimension to be 1.")
+    num_segments = int(cu_seqlens.numel() - 1)
+    if num_segments <= 0:
+        raise ValueError("cu_seqlens must contain at least one segment.")
+
+    if initial_state is None:
+        kv_init = torch.zeros(
+            num_segments,
+            q_num.shape[2],
+            feature_dim,
+            value_dim,
+            device=q_num.device,
+            dtype=torch.float32,
+        )
+        z_init = torch.zeros(
+            num_segments,
+            q_num.shape[2],
+            den_feature_dim,
+            device=q_num.device,
+            dtype=torch.float32,
+        )
+    else:
+        kv_init, z_init = initial_state
+        kv_init = kv_init.contiguous().float()
+        z_init = z_init.contiguous().float()
+        if kv_init.shape != (num_segments, q_num.shape[2], feature_dim, value_dim):
+            raise ValueError("initial_state kv_state shape does not match packed varlen input.")
+        if z_init.shape != (num_segments, q_num.shape[2], den_feature_dim):
+            raise ValueError("initial_state k_state shape does not match packed varlen input.")
+
+    out = torch.empty(
+        q_num.shape[0],
+        q_num.shape[1],
+        q_num.shape[2],
+        value_dim,
+        device=q_num.device,
+        dtype=v.dtype,
+    )
+    kv_final: list[torch.Tensor] = []
+    z_final: list[torch.Tensor] = []
+    for seg_idx in range(num_segments):
+        start = int(cu_seqlens[seg_idx].item())
+        end = int(cu_seqlens[seg_idx + 1].item())
+        out_seg, kv_seg, z_seg = _run_segment(
+            q_num[:, start:end],
+            k_num[:, start:end],
+            v32[:, start:end],
+            q_den[:, start:end],
+            k_den[:, start:end],
+            kv_init[seg_idx:seg_idx + 1],
+            z_init[seg_idx:seg_idx + 1],
+        )
+        out[:, start:end] = out_seg
+        kv_final.append(kv_seg.squeeze(0))
+        z_final.append(z_seg.squeeze(0))
+    final_state = None
+    if output_final_state:
+        final_state = (torch.stack(kv_final, dim=0), torch.stack(z_final, dim=0))
+    return out, final_state
+
+
 class PerformerPlusLinearAttention(nn.Module):
     """
     Causal Performer+ linear attention with:
     1) antithetic orthogonal random features and optional deterministic nodes,
     2) control-variate kernel decomposition (exact constant + linear terms),
-    3) selectable state update rule (`sum` or `delta`),
+    3) selectable state update rule (`sum`, `delta`, or `pdf_delta`/`overwrite`),
     4) optional hybrid numerator kernel in `delta` mode:
        concat([sqrt(alpha) * CV, sqrt(1-alpha) * positive]) to reduce variance,
     5) optional dual-map denominator in `delta` mode (positive denominator map),
@@ -580,6 +803,8 @@ class PerformerPlusLinearAttention(nn.Module):
         performer_delta_denominator_update: str = "delta",
         performer_delta_denominator_map: str = "auto",
         performer_delta_denominator_stopgrad: bool = False,
+        performer_pdf_delta_denom_stopgrad: bool = True,
+        performer_pdf_delta_feature_low_precision: bool = True,
         performer_delta_use_leaky_dplr: bool = False,
         performer_delta_leaky_rho_init: float = 1.0,
         performer_delta_leaky_min_lambda: float = 0.5,
@@ -689,6 +914,7 @@ class PerformerPlusLinearAttention(nn.Module):
         self.use_output_gate = performer_use_output_gate
         self.use_decay = performer_use_decay
         self.state_update = performer_state_update
+        self.pdf_delta_update = self.state_update in _PDF_DELTA_STATE_UPDATES
         self.delta_beta_norm = performer_delta_beta_norm
         self.delta_beta_norm_eps = performer_delta_beta_norm_eps
         self.delta_denom_eps = performer_delta_denom_eps
@@ -700,6 +926,8 @@ class PerformerPlusLinearAttention(nn.Module):
         self.delta_denominator_update = performer_delta_denominator_update
         self.delta_denominator_map = performer_delta_denominator_map
         self.delta_denominator_stopgrad = performer_delta_denominator_stopgrad
+        self.pdf_delta_denom_stopgrad = performer_pdf_delta_denom_stopgrad
+        self.pdf_delta_feature_low_precision = performer_pdf_delta_feature_low_precision
         self.delta_use_leaky_dplr = performer_delta_use_leaky_dplr
         self.delta_leaky_rho_init = performer_delta_leaky_rho_init
         self.delta_leaky_min_lambda = performer_delta_leaky_min_lambda
@@ -807,10 +1035,10 @@ class PerformerPlusLinearAttention(nn.Module):
             raise ValueError("performer_precondition_log_clip must be >= 0.")
         if self.precondition_mode not in ("diag", "full"):
             raise ValueError("performer_precondition_mode must be one of ('diag', 'full').")
-        if self.state_update not in ("sum", "delta"):
+        if self.state_update not in ("sum", "delta", "pdf_delta", "overwrite"):
             raise ValueError(
                 f"performer_state_update={self.state_update} is not supported. "
-                "Expected one of ('sum', 'delta').",
+                "Expected one of ('sum', 'delta', 'pdf_delta', 'overwrite').",
             )
         if self.control_variate_exp_clip is not None and self.control_variate_exp_clip <= 0:
             raise ValueError(
@@ -908,6 +1136,12 @@ class PerformerPlusLinearAttention(nn.Module):
             warnings.warn(
                 "`performer_use_decay=True` is ignored when performer_state_update='delta'. "
                 "Delta update does not support explicit exponential decay.",
+            )
+            self.use_decay = False
+        if self.pdf_delta_update and self.use_decay:
+            warnings.warn(
+                "`performer_use_decay=True` is ignored when performer_state_update in "
+                "{'pdf_delta','overwrite'}. The PDF delta update uses its own additive denominator state.",
             )
             self.use_decay = False
         if self.state_update != "delta" and self.delta_denominator_map != "auto":
@@ -1116,6 +1350,81 @@ class PerformerPlusLinearAttention(nn.Module):
                 "`performer_dim_aware_kernel_scale=True` is disabled when performer_qk_l2_norm=False.",
             )
             self.dim_aware_kernel_scale = False
+        if self.pdf_delta_update and self.use_beta:
+            warnings.warn(
+                "`performer_use_beta=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}. The PDF delta rule uses a closed-form correction write.",
+            )
+            self.use_beta = False
+        if self.pdf_delta_update and self.use_control_variate:
+            warnings.warn(
+                "`performer_use_control_variate=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}. This mode uses the plain shared FAVOR+ map from performer+delta.pdf.",
+            )
+            self.use_control_variate = False
+        if self.pdf_delta_update:
+            self.use_adaptive_linear_cv = False
+            self.use_second_order_cv = False
+            self.use_third_order_cv = False
+            self.use_cv_decoupled_second_order = False
+            self.use_cv_decoupled_adaptive_h2_ratio = False
+            self.use_diag2_term = False
+            self.use_hybrid_numerator = False
+        if self.pdf_delta_update and self.use_projection_ensemble:
+            warnings.warn(
+                "`performer_use_projection_ensemble=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.use_projection_ensemble = False
+        if self.pdf_delta_update and self.use_landmark_sampling:
+            warnings.warn(
+                "`performer_use_landmark_sampling=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.use_landmark_sampling = False
+        if self.pdf_delta_update and self.use_dual_map:
+            warnings.warn(
+                "`performer_use_dual_map=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}. This mode shares a single positive feature map for numerator/denominator.",
+            )
+            self.use_dual_map = False
+        if self.pdf_delta_update and self.use_jackknife_debias:
+            warnings.warn(
+                "`performer_use_jackknife_debias=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.use_jackknife_debias = False
+            self.use_jackknife_adaptive_shrinkage = False
+        if self.pdf_delta_update and self.delta_use_leaky_dplr:
+            warnings.warn(
+                "`performer_delta_use_leaky_dplr=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.delta_use_leaky_dplr = False
+        if self.pdf_delta_update and self.use_den_poly_kernel:
+            warnings.warn(
+                "`performer_use_den_poly_kernel=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.use_den_poly_kernel = False
+        if self.pdf_delta_update and self.use_adaptive_den_mix:
+            warnings.warn(
+                "`performer_use_adaptive_den_mix=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.use_adaptive_den_mix = False
+        if self.pdf_delta_update and self.use_error_feedback_den_ratio:
+            warnings.warn(
+                "`performer_use_error_feedback_den_ratio=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.use_error_feedback_den_ratio = False
+        if self.pdf_delta_update and self.use_layerwise_den_ratio:
+            warnings.warn(
+                "`performer_use_layerwise_den_ratio=True` is ignored for performer_state_update in "
+                "{'pdf_delta','overwrite'}.",
+            )
+            self.use_layerwise_den_ratio = False
         if not self.use_triton_kernel:
             raise ValueError(
                 "PerformerPlusLinearAttention is configured to run Triton-only. "
@@ -1362,7 +1671,7 @@ class PerformerPlusLinearAttention(nn.Module):
             self.landmark_alpha_logit = None
 
         # Lightweight approximation-error observability.
-        self.enable_error_observability = bool(kwargs.pop("performer_enable_error_observability", True))
+        self.enable_error_observability = bool(kwargs.pop("performer_enable_error_observability", False))
         self.error_observe_interval = max(1, int(kwargs.pop("performer_error_observe_interval", 10)))
         self.error_observe_max_tokens = max(4, int(kwargs.pop("performer_error_observe_max_tokens", 32)))
         self.error_observe_max_heads = max(1, int(kwargs.pop("performer_error_observe_max_heads", 2)))
@@ -1943,8 +2252,10 @@ class PerformerPlusLinearAttention(nn.Module):
             v = v * v_gate.unsqueeze(-1)
 
         if self.qk_l2_norm:
-            q = F.normalize(q.float(), dim=-1).to(q)
-            k = F.normalize(k.float(), dim=-1).to(k)
+            # Use the fused Triton L2Norm path (same family used by DeltaNet ops)
+            # to reduce intermediate activations compared with F.normalize(...float()).
+            q, _ = l2norm_fwd(q, eps=1e-6, output_dtype=q.dtype)
+            k, _ = l2norm_fwd(k, eps=1e-6, output_dtype=k.dtype)
 
         dual_precondition = None
         dual_precondition_inv = None
@@ -2085,7 +2396,18 @@ class PerformerPlusLinearAttention(nn.Module):
             coef = self._expand_head_vector(coef, q.shape[2], name="CV linear coefficient")
             linear_cv_coef = coef.to(q.dtype)
 
-        if self.use_control_variate:
+        if self.pdf_delta_update:
+            q_prime = _performer_shared_softmax_feature_map(
+                q_kernel,
+                projection_matrix=projection_matrix_base,
+                eps=self.feature_eps,
+            )
+            k_prime = _performer_shared_softmax_feature_map(
+                k_kernel,
+                projection_matrix=projection_matrix_base,
+                eps=self.feature_eps,
+            )
+        elif self.use_control_variate:
             use_decoupled_cv2 = (
                 self.use_cv_decoupled_second_order
                 and self.use_second_order_cv
@@ -2411,6 +2733,13 @@ class PerformerPlusLinearAttention(nn.Module):
                 ],
                 dim=-1,
             )
+        if self.pdf_delta_update and self.pdf_delta_feature_low_precision:
+            if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+                target_dtype = q.dtype
+                if q_prime.dtype != target_dtype:
+                    q_prime = q_prime.to(target_dtype)
+                if k_prime.dtype != target_dtype:
+                    k_prime = k_prime.to(target_dtype)
         q_prime_den = None
         k_prime_den = None
         q_prime_den_fp32 = None
@@ -2419,7 +2748,11 @@ class PerformerPlusLinearAttention(nn.Module):
         adaptive_den_mix_alpha = None
         den_ratio_effective = None
         den_map_effective = "disabled"
-        if self.state_update == "delta":
+        if self.pdf_delta_update:
+            q_prime_den = q_prime
+            k_prime_den = k_prime
+            den_map_effective = "shared_softmax"
+        elif self.state_update == "delta":
             den_map = self.delta_denominator_map
             if den_map == "auto":
                 den_map = "dual_softmax" if self.use_dual_map and self.use_control_variate else "numerator"
@@ -2809,11 +3142,6 @@ class PerformerPlusLinearAttention(nn.Module):
                     self.last_error_stats["obs_error_feedback_den_ratio_ema"] = float(ratio_updated)
                     self.last_error_stats["obs_error_feedback_den_frac"] = float(den_frac_val)
 
-        if not _PERFORMER_PLUS_TRITON_AVAILABLE:
-            raise RuntimeError("PerformerPlusLinearAttention requires Triton, but Triton kernel is unavailable.")
-        if not q_prime.is_cuda:
-            raise RuntimeError("PerformerPlusLinearAttention Triton path requires CUDA tensors.")
-
         log_decay = None
         if self.use_decay:
             decay_logits = self.decay_proj(hidden_states).float()
@@ -2821,27 +3149,50 @@ class PerformerPlusLinearAttention(nn.Module):
             log_decay = F.logsigmoid(decay_logits)
 
         initial_recurrent_state = recurrent_state
-        o, recurrent_state = performer_plus_causal_linear_attention_triton(
-            q_prime=q_prime,
-            k_prime=k_prime,
-            v=v,
-            q_prime_den=q_prime_den,
-            k_prime_den=k_prime_den,
-            beta=beta,
-            beta_den=beta_den,
-            log_decay=log_decay,
-            initial_state=recurrent_state,
-            output_final_state=use_cache,
-            cu_seqlens=cu_seqlens,
-            update_rule=self.state_update,
-            delta_denom_eps=delta_denom_eps_effective,
-            delta_smooth_denom=self.delta_smooth_denom,
-            delta_denom_tau=self.delta_denom_tau,
-            delta_log_decay=delta_log_decay,
-            delta_denominator_update=self.delta_denominator_update,
-            delta_denominator_stopgrad=self.delta_denominator_stopgrad,
-        )
-        if self.use_jackknife_debias:
+        if self.pdf_delta_update:
+            if not _PERFORMER_PLUS_TRITON_AVAILABLE:
+                raise RuntimeError("PerformerPlusLinearAttention requires Triton, but Triton kernel is unavailable.")
+            if not q_prime.is_cuda:
+                raise RuntimeError("PerformerPlusLinearAttention Triton path requires CUDA tensors.")
+            o, recurrent_state = performer_plus_pdf_delta_attention_triton(
+                q_prime=q_prime,
+                k_prime=k_prime,
+                v=v,
+                q_prime_den=q_prime_den,
+                k_prime_den=k_prime_den,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+                eps=1e-6,
+                denom_eps=delta_denom_eps_effective,
+                denom_stopgrad=self.pdf_delta_denom_stopgrad,
+            )
+        else:
+            if not _PERFORMER_PLUS_TRITON_AVAILABLE:
+                raise RuntimeError("PerformerPlusLinearAttention requires Triton, but Triton kernel is unavailable.")
+            if not q_prime.is_cuda:
+                raise RuntimeError("PerformerPlusLinearAttention Triton path requires CUDA tensors.")
+            o, recurrent_state = performer_plus_causal_linear_attention_triton(
+                q_prime=q_prime,
+                k_prime=k_prime,
+                v=v,
+                q_prime_den=q_prime_den,
+                k_prime_den=k_prime_den,
+                beta=beta,
+                beta_den=beta_den,
+                log_decay=log_decay,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                cu_seqlens=cu_seqlens,
+                update_rule=self.state_update,
+                delta_denom_eps=delta_denom_eps_effective,
+                delta_smooth_denom=self.delta_smooth_denom,
+                delta_denom_tau=self.delta_denom_tau,
+                delta_log_decay=delta_log_decay,
+                delta_denominator_update=self.delta_denominator_update,
+                delta_denominator_stopgrad=self.delta_denominator_stopgrad,
+            )
+        if self.use_jackknife_debias and not self.pdf_delta_update:
             den_q_base = q_prime_den if q_prime_den is not None else q_prime
             den_k_base = k_prime_den if k_prime_den is not None else k_prime
             num_ranges = self._split_feature_ranges(q_prime.shape[-1], self.jackknife_groups)

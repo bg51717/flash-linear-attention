@@ -16,6 +16,176 @@ except Exception:  # pragma: no cover - runtime fallback
     _TRITON_AVAILABLE = False
 
 
+def _to_kernel_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if not x.is_contiguous():
+        x = x.contiguous()
+    if x.dtype != dtype:
+        x = x.to(dtype)
+    return x
+
+
+def performer_plus_pdf_delta_attention_triton(
+    q_prime: torch.Tensor,
+    k_prime: torch.Tensor,
+    v: torch.Tensor,
+    q_prime_den: torch.Tensor | None = None,
+    k_prime_den: torch.Tensor | None = None,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
+    output_final_state: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    eps: float = 1e-6,
+    denom_eps: float = 1e-6,
+    denom_stopgrad: bool = True,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """
+    Triton implementation for the updated PDF Performer+delta rule.
+
+    Target recurrence (paper update):
+        W_t = W_{t-1} - (W_{t-1} phi_t / (z_{t-1}^T phi_t)) phi_t^T + v_t phi_t^T
+        z_t = z_{t-1} + 2 phi_t
+        o_t = (W_t psi_t) / (z_t^T psi_t + eps)
+
+    We realize this with three fused Triton passes:
+      1) `d_t = z_{t-1}^T phi_t` via a sum-denominator pass and self-term removal.
+      2) Numerator recurrence via generalized DPLR delta-rule:
+           S_t = S_{t-1} @ (I + a_t b_t^T) + v_t k_t^T
+         with `a_t = -phi_t / d_t`, `b_t = phi_t`, `k_t = phi_t`.
+      3) Final denominator `z_t^T psi_t` via sum-denominator pass with `2*phi_t`.
+    """
+    if q_prime.ndim != 4 or k_prime.ndim != 4 or v.ndim != 4:
+        raise ValueError("q_prime, k_prime, v must have shape [B, T, H, D].")
+    if q_prime.shape[:3] != k_prime.shape[:3] or q_prime.shape[:3] != v.shape[:3]:
+        raise ValueError("Leading dimensions of q_prime, k_prime, v must match.")
+    if q_prime_den is None:
+        q_prime_den = q_prime
+    if k_prime_den is None:
+        k_prime_den = k_prime
+    if q_prime_den.ndim != 4 or k_prime_den.ndim != 4:
+        raise ValueError("q_prime_den and k_prime_den must have shape [B, T, H, D].")
+    if q_prime_den.shape[:3] != q_prime.shape[:3] or k_prime_den.shape[:3] != q_prime.shape[:3]:
+        raise ValueError("Leading dimensions of denominator maps must match q_prime.")
+    if eps <= 0:
+        raise ValueError(f"eps must be > 0, got {eps}.")
+    if denom_eps <= 0:
+        raise ValueError(f"denom_eps must be > 0, got {denom_eps}.")
+    if chunk_dplr_delta_rule is None or fused_recurrent_simple_gla is None:
+        raise RuntimeError("PDF delta Triton operator requires chunk_dplr_delta_rule and fused_recurrent_simple_gla.")
+    if not _TRITON_AVAILABLE:
+        raise RuntimeError("Performer+ Triton operator is not available in current environment.")
+    if not (q_prime.is_cuda and k_prime.is_cuda and q_prime_den.is_cuda and k_prime_den.is_cuda and v.is_cuda):
+        raise RuntimeError("Performer+ Triton operator requires CUDA tensors.")
+
+    kernel_dtype = v.dtype
+    if kernel_dtype == torch.float32:
+        kernel_dtype = torch.bfloat16
+    q_num_kernel = _to_kernel_dtype(q_prime, kernel_dtype)
+    k_num_kernel = _to_kernel_dtype(k_prime, kernel_dtype)
+    q_den_kernel = _to_kernel_dtype(q_prime_den, kernel_dtype)
+    k_den_kernel = _to_kernel_dtype(k_prime_den, kernel_dtype)
+    v_kernel = _to_kernel_dtype(v, kernel_dtype)
+
+    initial_state_kv = None
+    initial_state_k = None
+    if initial_state is not None:
+        if len(initial_state) != 2:
+            raise ValueError("initial_state must be (kv_state, k_state).")
+        initial_state_kv = initial_state[0].contiguous()
+        initial_state_k = initial_state[1].contiguous().to(torch.float32)
+        if initial_state_kv.ndim != 4:
+            raise ValueError("initial_state kv_state must have shape [N, H, M, V].")
+        if initial_state_k.ndim != 3:
+            raise ValueError("initial_state k_state must have shape [N, H, M].")
+        if initial_state_kv.shape[:2] != initial_state_k.shape[:2]:
+            raise ValueError("initial_state leading [N, H] dims must match.")
+        if initial_state_kv.shape[2] != k_prime.shape[-1]:
+            raise ValueError("initial_state kv_state feature dim must match k_prime.")
+        if initial_state_k.shape[2] != k_prime_den.shape[-1]:
+            raise ValueError("initial_state k_state feature dim must match k_prime_den.")
+        if initial_state_kv.dtype != kernel_dtype:
+            initial_state_kv = initial_state_kv.to(kernel_dtype)
+
+    # Pass 1: compute d_t = z_{t-1}^T phi_t.
+    # We get inclusive mass with z_{t-1} + 2*phi_t then remove the self term.
+    ones = torch.ones((*v_kernel.shape[:3], 1), device=v_kernel.device, dtype=kernel_dtype)
+    ones_twice = (2.0 * ones).contiguous()
+    den_init = None if initial_state_k is None else initial_state_k.unsqueeze(-1).to(kernel_dtype)
+    den_q = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
+    den_k = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
+    den_state = den_init.detach() if (denom_stopgrad and den_init is not None) else den_init
+    den_hist_inclusive, _ = fused_recurrent_simple_gla(
+        q=den_q,
+        k=den_k,
+        v=ones_twice,
+        g=None,
+        scale=1.0,
+        initial_state=den_state,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+    )
+    self_term_src = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
+    self_term = 2.0 * self_term_src.float().square().sum(dim=-1, keepdim=True)
+    den_prev_safe = (den_hist_inclusive.float() - self_term).clamp_min(float(denom_eps))
+    if denom_stopgrad:
+        den_prev_safe = den_prev_safe.detach()
+
+    # Pass 2: numerator update.
+    # Prefer the fused delta-rule kernel when available to reduce temporary
+    # tensors (a/b/gk in the DPLR formulation) and improve memory efficiency.
+    if fused_recurrent_delta_rule is not None:
+        beta_pdf = den_prev_safe.reciprocal().squeeze(-1).to(torch.float32)
+        v_pdf = v_kernel * den_prev_safe.to(v_kernel.dtype)
+        num, kv_final = fused_recurrent_delta_rule(
+            q=q_num_kernel,
+            k=k_num_kernel,
+            v=v_pdf,
+            beta=beta_pdf,
+            scale=1.0,
+            initial_state=initial_state_kv,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+        )
+    else:
+        a = -(k_num_kernel.float() / den_prev_safe).to(k_num_kernel.dtype)
+        b = k_num_kernel
+        gk = torch.zeros_like(k_num_kernel)
+        num, kv_final = chunk_dplr_delta_rule(
+            q=q_num_kernel,
+            k=k_num_kernel,
+            v=v_kernel,
+            a=a,
+            b=b,
+            gk=gk,
+            scale=1.0,
+            initial_state=initial_state_kv,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+        )
+
+    # Pass 3: final denominator z_t^T psi_t with z_t = z_{t-1} + 2*phi_t.
+    den_q_out = q_den_kernel.detach() if denom_stopgrad else q_den_kernel
+    den_k_out = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
+    den_state_out = den_init.detach() if (denom_stopgrad and den_init is not None) else den_init
+    den_out, z_final = fused_recurrent_simple_gla(
+        q=den_q_out,
+        k=den_k_out,
+        v=ones_twice,
+        g=None,
+        scale=1.0,
+        initial_state=den_state_out,
+        output_final_state=output_final_state,
+        cu_seqlens=cu_seqlens,
+    )
+    den_used = den_out.detach() if denom_stopgrad else den_out
+    # Keep the final ratio in kernel dtype (bf16/fp16) to reduce peak memory
+    # and avoid materializing an extra fp32-sized activation tensor.
+    out = num / den_used.clamp_min(float(eps))
+    final_state = None
+    if output_final_state:
+        final_state = (kv_final, z_final.squeeze(-1).to(torch.float32))
+    return out, final_state
+
+
 def performer_plus_causal_linear_attention_triton(
     q_prime: torch.Tensor,
     k_prime: torch.Tensor,
@@ -310,4 +480,8 @@ def performer_plus_causal_linear_attention_triton(
     return out, final_state
 
 
-__all__ = ['performer_plus_causal_linear_attention_triton', '_TRITON_AVAILABLE']
+__all__ = [
+    'performer_plus_causal_linear_attention_triton',
+    'performer_plus_pdf_delta_attention_triton',
+    '_TRITON_AVAILABLE',
+]
