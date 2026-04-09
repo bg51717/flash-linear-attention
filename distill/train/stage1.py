@@ -6,6 +6,7 @@ import torch.nn as nn
 from pathlib import Path
 import shutil
 import os
+import re
 from typing import Any, Union, Optional
 from transformers import (
     TrainingArguments,
@@ -48,7 +49,48 @@ utils_files = {
     "models/linear_attention_performer_plus_triton.py",
     "models/linear_attention_pdf_triton.py",
     "models/linear_attention_pdf_triton_kernels.py",
+    "models/dual_delta_rule_naive.py",
+    "models/dual_delta_rule.py",
+    "models/dual_delta_net.py",
 }
+
+
+def _collect_relative_import_files(module_file: Path) -> set[Path]:
+    """Collect recursive relative-import files (e.g. from .foo import bar -> foo.py)."""
+    pattern_import = re.compile(r"^\s*import\s+\.(\S+)\s*$", flags=re.MULTILINE)
+    pattern_from = re.compile(r"^\s*from\s+\.(\S+)\s+import", flags=re.MULTILINE)
+    module_file = module_file.resolve()
+    module_dir = module_file.parent
+    pending = [module_file]
+    seen: set[Path] = set()
+    while pending:
+        cur = pending.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if not cur.exists():
+            continue
+        text = cur.read_text(encoding="utf-8")
+        rels = set(pattern_import.findall(text) + pattern_from.findall(text))
+        for rel in rels:
+            rel_path = module_dir / f"{rel}.py"
+            if rel_path not in seen:
+                pending.append(rel_path)
+    return seen
+
+
+def _validate_remote_code_export(save_dir: Path, entry: str = "modeling_llamala.py") -> None:
+    entry_file = save_dir / entry
+    if not entry_file.exists():
+        raise RuntimeError(f"Missing remote-code entry file: {entry_file}")
+    needed = _collect_relative_import_files(entry_file)
+    missing = [str(p) for p in sorted(needed) if not p.exists()]
+    if missing:
+        joined = "\n  - ".join(missing)
+        raise RuntimeError(
+            "Remote-code export incomplete. Missing recursively imported files:\n"
+            f"  - {joined}"
+        )
 
 class MSETrainer(Trainer):
     OBSERVE_INTERVAL = 10
@@ -493,6 +535,7 @@ def main():
         for utils_file in utils_files:
             file_name = utils_file.split("/")[-1]
             shutil.copy(current_dir / utils_file, save_dir / file_name)
+        _validate_remote_code_export(save_dir)
         print(f"Model saved to {save_dir}")
 
 

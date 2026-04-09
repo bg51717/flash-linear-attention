@@ -17,6 +17,7 @@ from .linear_attention_pdf_final import PDFFinalLinearAttention
 from .linear_attention_performer import PerformerLinearAttention
 from .linear_attention_performer_plus import PerformerPlusLinearAttention
 from .linear_attention_taylor import TaylorLinearAttention
+from .dual_delta_net import DualDeltaNet
 
 
 class TorchMHAAttention(nn.Module):
@@ -161,6 +162,8 @@ class TorchMHAAttention(nn.Module):
 TYPE2ATTN = {
     "gated_deltanet": gated_deltanet.GatedDeltaNet,
     "delta_net": delta_net.DeltaNet,
+    "dual_delta_net": DualDeltaNet,
+    "dual_deltanet": DualDeltaNet,
     "pdf_linear_attention": FirstOrderLinearAttention,
     "first_order_linear_attention": FirstOrderLinearAttention,
     "pdf_final_linear_attention": PDFFinalLinearAttention,
@@ -207,6 +210,40 @@ CONFIG2KWARGS = {
         "allow_neg_eigval": lambda cfg: getattr(cfg, "allow_neg_eigval", False),
         "qk_activation": lambda cfg: getattr(cfg, "qk_activation", "silu"),
         "qk_norm": lambda cfg: getattr(cfg, "qk_norm", "l2"),
+    },
+    "dual_delta_net": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "mode": lambda cfg: getattr(cfg, "dual_delta_net_mode", "fused_recurrent"),
+        "expand_k": lambda cfg: getattr(cfg, "expand_k", 1.0),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_gate": lambda cfg: getattr(cfg, "use_gate", False),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "qk_activation": lambda cfg: getattr(cfg, "qk_activation", "silu"),
+        "qk_norm": lambda cfg: getattr(cfg, "qk_norm", "l2"),
+        "value_l2_norm": lambda cfg: getattr(cfg, "dual_delta_value_l2_norm", True),
+        "value_norm_eps": lambda cfg: getattr(cfg, "dual_delta_value_norm_eps", 1e-6),
+        "dual_recompute_chunk_size": lambda cfg: getattr(cfg, "dual_recompute_chunk_size", 128),
+    },
+    "dual_deltanet": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "mode": lambda cfg: getattr(cfg, "dual_delta_net_mode", "fused_recurrent"),
+        "expand_k": lambda cfg: getattr(cfg, "expand_k", 1.0),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_gate": lambda cfg: getattr(cfg, "use_gate", False),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "qk_activation": lambda cfg: getattr(cfg, "qk_activation", "silu"),
+        "qk_norm": lambda cfg: getattr(cfg, "qk_norm", "l2"),
+        "value_l2_norm": lambda cfg: getattr(cfg, "dual_delta_value_l2_norm", True),
+        "value_norm_eps": lambda cfg: getattr(cfg, "dual_delta_value_norm_eps", 1e-6),
+        "dual_recompute_chunk_size": lambda cfg: getattr(cfg, "dual_recompute_chunk_size", 128),
     },
     "pdf_linear_attention": {
         "hidden_size": "hidden_size",

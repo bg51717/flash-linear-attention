@@ -542,38 +542,28 @@ def performer_plus_pdf_delta_attention(
     k_prime: torch.Tensor,
     v: torch.Tensor,
     *,
+    rho: torch.Tensor | None = None,
     q_prime_den: torch.Tensor | None = None,
     k_prime_den: torch.Tensor | None = None,
     initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     eps: float = 1e-6,
+    forget_norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """
-    Performer+ delta update inspired by `performer+delta.pdf`.
-
-    The updated PDF defines an intermediate state via one standard Performer
-    update that writes the negative current output at the current key:
-
-        S_t^- = Update_perf(S_{t-1}, k_t, -Output_perf(S_{t-1}, k_t))
-
-    followed by a normal Performer write with `v_t`. With shared positive
-    features `phi_t = phi(k_t)` and `psi_t = phi(q_t)`, this yields:
+    Performer+ rho-Delta update from `distill/test/docs/performer+delta.md`:
 
         W_t = W_{t-1}
-              - (W_{t-1} phi_t / (z_{t-1}^T phi_t)) phi_t^T
+              - (1-rho_t) * (W_{t-1} phi_t phi_t^T / ||phi_t||^2)
               + v_t phi_t^T
-        z_t = z_{t-1} + 2 phi_t
+        z_t = z_{t-1} + phi_t
+        o_t = (W_t psi_t) / (z_t^T psi_t + eps)
 
-    In the transposed state layout used here, `kv_state` has shape [N, H, M, V]
-    and stores W^T. The recurrence is:
+    where rho_t in [0, 1] controls retained mass on the current key direction:
+      rho_t=0 => full forget on current key, rho_t=1 => no forget.
 
-        y_t = kv_state_{t-1}^T phi_t
-        d_t = z_{t-1}^T phi_t
-        o_t^- = y_t / d_t
-        kv_state_t = kv_state_{t-1} + phi_t (v_t - o_t^-)^T
-        z_t = z_{t-1} + 2 phi_t
-        o_t = kv_state_t^T psi_t / (z_t^T psi_t + eps)
+    State layout stores W^T as `kv_state` with shape [N, H, M, V].
     """
     if q_prime.ndim != 4 or k_prime.ndim != 4 or v.ndim != 4:
         raise ValueError("q_prime, k_prime, v must have shape [B, T, H, D].")
@@ -589,12 +579,28 @@ def performer_plus_pdf_delta_attention(
         raise ValueError("Leading dimensions of denominator maps must match q_prime.")
     if eps <= 0:
         raise ValueError(f"eps must be > 0, got {eps}.")
+    if forget_norm_eps <= 0:
+        raise ValueError(f"forget_norm_eps must be > 0, got {forget_norm_eps}.")
 
     q_num = q_prime.float()
     k_num = k_prime.float()
     q_den = q_prime_den.float()
     k_den = k_prime_den.float()
     v32 = v.float()
+    if rho is None:
+        rho32 = torch.zeros(
+            q_num.shape[0],
+            q_num.shape[1],
+            q_num.shape[2],
+            device=q_num.device,
+            dtype=torch.float32,
+        )
+    else:
+        if rho.ndim != 3:
+            raise ValueError("rho must have shape [B, T, H].")
+        if rho.shape != q_num.shape[:3]:
+            raise ValueError("rho shape must match q_prime[:, :, :, 0].")
+        rho32 = rho.float().clamp(0.0, 1.0)
 
     feature_dim = k_num.shape[-1]
     den_feature_dim = k_den.shape[-1]
@@ -604,6 +610,7 @@ def performer_plus_pdf_delta_attention(
         q_seg: torch.Tensor,
         k_seg: torch.Tensor,
         v_seg: torch.Tensor,
+        rho_seg: torch.Tensor,
         q_den_seg: torch.Tensor,
         k_den_seg: torch.Tensor,
         kv_state: torch.Tensor,
@@ -616,18 +623,19 @@ def performer_plus_pdf_delta_attention(
             psi_num = q_seg[:, t]
             psi_den = q_den_seg[:, t]
             value_t = v_seg[:, t]
+            rho_t = rho_seg[:, t].unsqueeze(-1)
 
             current_num_at_key = torch.einsum('nhmv,nhm->nhv', kv_state, phi_num)
-            current_den_at_key = (z_state * phi_den).sum(dim=-1, keepdim=True).clamp_min(float(eps))
-            current_output_at_key = current_num_at_key / current_den_at_key
-            delta_value = value_t - current_output_at_key
+            phi_norm_sq = phi_num.square().sum(dim=-1, keepdim=True).clamp_min(float(forget_norm_eps))
+            forget_coeff = (1.0 - rho_t) / phi_norm_sq
+            delta_value = value_t - forget_coeff * current_num_at_key
 
             kv_state = kv_state + torch.einsum(
                 'nhm,nhv->nhmv',
                 phi_num,
                 delta_value,
             )
-            z_state = z_state + 2.0 * phi_den
+            z_state = z_state + phi_den
 
             num_t = torch.einsum('nhmv,nhm->nhv', kv_state, psi_num)
             den_t = (z_state * psi_den).sum(dim=-1, keepdim=True).clamp_min(float(eps))
@@ -661,7 +669,7 @@ def performer_plus_pdf_delta_attention(
                 raise ValueError("initial_state kv_state shape does not match dense input.")
             if z_state.shape != (batch, q_num.shape[2], den_feature_dim):
                 raise ValueError("initial_state k_state shape does not match dense input.")
-        out, kv_state, z_state = _run_segment(q_num, k_num, v32, q_den, k_den, kv_state, z_state)
+        out, kv_state, z_state = _run_segment(q_num, k_num, v32, rho32, q_den, k_den, kv_state, z_state)
         final_state = (kv_state, z_state) if output_final_state else None
         return out, final_state
 
@@ -713,6 +721,7 @@ def performer_plus_pdf_delta_attention(
             q_num[:, start:end],
             k_num[:, start:end],
             v32[:, start:end],
+            rho32[:, start:end],
             q_den[:, start:end],
             k_den[:, start:end],
             kv_init[seg_idx:seg_idx + 1],
@@ -805,6 +814,7 @@ class PerformerPlusLinearAttention(nn.Module):
         performer_delta_denominator_stopgrad: bool = False,
         performer_pdf_delta_denom_stopgrad: bool = True,
         performer_pdf_delta_feature_low_precision: bool = True,
+        performer_pdf_delta_forget_norm_eps: float = 1e-6,
         performer_delta_use_leaky_dplr: bool = False,
         performer_delta_leaky_rho_init: float = 1.0,
         performer_delta_leaky_min_lambda: float = 0.5,
@@ -928,6 +938,7 @@ class PerformerPlusLinearAttention(nn.Module):
         self.delta_denominator_stopgrad = performer_delta_denominator_stopgrad
         self.pdf_delta_denom_stopgrad = performer_pdf_delta_denom_stopgrad
         self.pdf_delta_feature_low_precision = performer_pdf_delta_feature_low_precision
+        self.pdf_delta_forget_norm_eps = performer_pdf_delta_forget_norm_eps
         self.delta_use_leaky_dplr = performer_delta_use_leaky_dplr
         self.delta_leaky_rho_init = performer_delta_leaky_rho_init
         self.delta_leaky_min_lambda = performer_delta_leaky_min_lambda
@@ -1352,10 +1363,9 @@ class PerformerPlusLinearAttention(nn.Module):
             self.dim_aware_kernel_scale = False
         if self.pdf_delta_update and self.use_beta:
             warnings.warn(
-                "`performer_use_beta=True` is ignored for performer_state_update in "
-                "{'pdf_delta','overwrite'}. The PDF delta rule uses a closed-form correction write.",
+                "`performer_use_beta=True` in performer_state_update in {'pdf_delta','overwrite'} "
+                "is interpreted as rho-gating for the rho-Delta forget term.",
             )
-            self.use_beta = False
         if self.pdf_delta_update and self.use_control_variate:
             warnings.warn(
                 "`performer_use_control_variate=True` is ignored for performer_state_update in "
@@ -1425,6 +1435,10 @@ class PerformerPlusLinearAttention(nn.Module):
                 "{'pdf_delta','overwrite'}.",
             )
             self.use_layerwise_den_ratio = False
+        if self.pdf_delta_forget_norm_eps <= 0:
+            raise ValueError(
+                f"performer_pdf_delta_forget_norm_eps must be > 0, got {self.pdf_delta_forget_norm_eps}."
+            )
         if not self.use_triton_kernel:
             raise ValueError(
                 "PerformerPlusLinearAttention is configured to run Triton-only. "
@@ -3072,6 +3086,21 @@ class PerformerPlusLinearAttention(nn.Module):
                 beta = beta_num.to(k_prime.dtype)
             if beta_den is None:
                 beta_den = beta
+        rho_pdf = None
+        if self.pdf_delta_update:
+            if beta is None:
+                rho_pdf = torch.zeros_like(k_prime[..., 0], dtype=k_prime.dtype)
+            else:
+                rho_pdf = beta
+            if rho_pdf.shape[-1] != k_prime.shape[2]:
+                if k_prime.shape[2] % rho_pdf.shape[-1] != 0:
+                    raise ValueError(
+                        "rho head mismatch for pdf_delta: "
+                        f"rho has {rho_pdf.shape[-1]} heads but k_prime has {k_prime.shape[2]}."
+                    )
+                groups = k_prime.shape[2] // rho_pdf.shape[-1]
+                rho_pdf = repeat(rho_pdf, 'b t h -> b t (h g)', g=groups)
+            rho_pdf = rho_pdf.clamp(0.0, 1.0)
 
         if self.feature_pairwise_balance:
             q_prime, k_prime = self._pairwise_balance_features(
@@ -3158,6 +3187,7 @@ class PerformerPlusLinearAttention(nn.Module):
                 q_prime=q_prime,
                 k_prime=k_prime,
                 v=v,
+                rho=rho_pdf,
                 q_prime_den=q_prime_den,
                 k_prime_den=k_prime_den,
                 initial_state=recurrent_state,
@@ -3166,6 +3196,7 @@ class PerformerPlusLinearAttention(nn.Module):
                 eps=1e-6,
                 denom_eps=delta_denom_eps_effective,
                 denom_stopgrad=self.pdf_delta_denom_stopgrad,
+                forget_norm_eps=self.pdf_delta_forget_norm_eps,
             )
         else:
             if not _PERFORMER_PLUS_TRITON_AVAILABLE:

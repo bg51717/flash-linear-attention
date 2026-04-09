@@ -127,7 +127,7 @@ def _run_module_case() -> None:
 
     assert module.pdf_delta_update
     assert not module.use_control_variate
-    assert not module.use_beta
+    assert module.use_beta
     assert not module.use_decay
 
     hidden_states = torch.randn(2, 13, 48, device=device, dtype=torch.float32, requires_grad=True)
@@ -168,11 +168,14 @@ def _run_pdf_delta_triton_vs_torch_case() -> None:
     q_tri = q_ref.detach().clone().to(torch.bfloat16).requires_grad_(True)
     k_tri = k_ref.detach().clone().to(torch.bfloat16).requires_grad_(True)
     v_tri = v_ref.detach().clone().to(torch.bfloat16).requires_grad_(True)
+    rho_ref = torch.sigmoid(torch.randn(2, 21, 6, device=device, dtype=torch.float32)).requires_grad_(True)
+    rho_tri = rho_ref.detach().clone().to(torch.bfloat16).requires_grad_(True)
 
     out_ref, state_ref = performer_plus_pdf_delta_attention(
         q_ref,
         k_ref,
         v_ref,
+        rho=rho_ref,
         output_final_state=True,
         eps=1e-6,
     )
@@ -180,6 +183,7 @@ def _run_pdf_delta_triton_vs_torch_case() -> None:
         q_prime=q_tri,
         k_prime=k_tri,
         v=v_tri,
+        rho=rho_tri,
         output_final_state=True,
         eps=1e-6,
         denom_eps=1e-6,
@@ -195,10 +199,10 @@ def _run_pdf_delta_triton_vs_torch_case() -> None:
     loss_tri = out_tri.float().pow(2).mean() + state_tri[0].float().pow(2).mean() * 1e-4
     loss_ref.backward()
     loss_tri.backward()
-    assert q_ref.grad is not None and k_ref.grad is not None and v_ref.grad is not None
-    assert q_tri.grad is not None and k_tri.grad is not None and v_tri.grad is not None
-    assert torch.isfinite(q_ref.grad).all() and torch.isfinite(k_ref.grad).all() and torch.isfinite(v_ref.grad).all()
-    assert torch.isfinite(q_tri.grad).all() and torch.isfinite(k_tri.grad).all() and torch.isfinite(v_tri.grad).all()
+    assert q_ref.grad is not None and k_ref.grad is not None and v_ref.grad is not None and rho_ref.grad is not None
+    assert q_tri.grad is not None and k_tri.grad is not None and v_tri.grad is not None and rho_tri.grad is not None
+    assert torch.isfinite(q_ref.grad).all() and torch.isfinite(k_ref.grad).all() and torch.isfinite(v_ref.grad).all() and torch.isfinite(rho_ref.grad).all()
+    assert torch.isfinite(q_tri.grad).all() and torch.isfinite(k_tri.grad).all() and torch.isfinite(v_tri.grad).all() and torch.isfinite(rho_tri.grad).all()
     assert torch.allclose(
         q_ref.grad.float(),
         q_tri.grad.float(),
@@ -214,6 +218,12 @@ def _run_pdf_delta_triton_vs_torch_case() -> None:
     assert torch.allclose(
         v_ref.grad.float(),
         v_tri.grad.float(),
+        atol=2e-4,
+        rtol=1e-1,
+    )
+    assert torch.allclose(
+        rho_ref.grad.float(),
+        rho_tri.grad.float(),
         atol=2e-4,
         rtol=1e-1,
     )

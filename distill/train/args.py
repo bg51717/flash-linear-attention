@@ -7,7 +7,23 @@ class ModelArguments:
     )
     linear_attention_type: str = field(
         default="gated_deltanet",
-        metadata={"help": "Type of attention mechanism to use, e.g. gated_deltanet, delta_net, first_order_linear_attention, pdf_final_linear_attention (or pdf_refined_linear_attention, final simplified recurrence from Approximating Self-attention.pdf), taylor_linear_attention (or softmax_taylor_linear_attention, using exp(q^T k) ~= 1 + q^T k), original_linear_attention (or vanilla_linear_attention, backed by FLA official LinearAttention with identity feature map), mha_attention (or mha, strict FLA official), mha_torch_attention (fallback), mha_torch_qk_unit_norm_attention (or mha_torch_qk_unit_norm, L2-normalize q/k to unit norm after q_proj/k_proj), performer_linear_attention, performer_plus_linear_attention."}
+        metadata={"help": "Type of attention mechanism to use, e.g. gated_deltanet, delta_net, dual_delta_net, first_order_linear_attention, pdf_final_linear_attention (or pdf_refined_linear_attention, final simplified recurrence from Approximating Self-attention.pdf), taylor_linear_attention (or softmax_taylor_linear_attention, using exp(q^T k) ~= 1 + q^T k), original_linear_attention (or vanilla_linear_attention, backed by FLA official LinearAttention with identity feature map), mha_attention (or mha, strict FLA official), mha_torch_attention (fallback), mha_torch_qk_unit_norm_attention (or mha_torch_qk_unit_norm, L2-normalize q/k to unit norm after q_proj/k_proj), performer_linear_attention, performer_plus_linear_attention."}
+    )
+    dual_delta_net_mode: str = field(
+        default="fused_recurrent",
+        metadata={"help": "Kernel mode for dual_delta_net. Currently fused_recurrent is implemented."}
+    )
+    dual_recompute_chunk_size: int = field(
+        default=128,
+        metadata={"help": "Backward recompute chunk size for dual_delta_net. Smaller reduces backward peak memory."}
+    )
+    dual_delta_value_l2_norm: bool = field(
+        default=True,
+        metadata={"help": "Apply per-head L2 normalization to value states in dual_delta_net."}
+    )
+    dual_delta_value_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon used by value L2 normalization in dual_delta_net."}
     )
     pdf_final_use_triton: bool = field(
         default=True,

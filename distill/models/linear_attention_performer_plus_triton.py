@@ -28,6 +28,7 @@ def performer_plus_pdf_delta_attention_triton(
     q_prime: torch.Tensor,
     k_prime: torch.Tensor,
     v: torch.Tensor,
+    rho: torch.Tensor | None = None,
     q_prime_den: torch.Tensor | None = None,
     k_prime_den: torch.Tensor | None = None,
     initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -36,21 +37,22 @@ def performer_plus_pdf_delta_attention_triton(
     eps: float = 1e-6,
     denom_eps: float = 1e-6,
     denom_stopgrad: bool = True,
+    forget_norm_eps: float = 1e-6,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
     """
-    Triton implementation for the updated PDF Performer+delta rule.
-
-    Target recurrence (paper update):
-        W_t = W_{t-1} - (W_{t-1} phi_t / (z_{t-1}^T phi_t)) phi_t^T + v_t phi_t^T
-        z_t = z_{t-1} + 2 phi_t
+    Triton implementation for rho-Delta Performer+ update:
+        W_t = W_{t-1}
+              - (1-rho_t) * (W_{t-1} phi_t phi_t^T / ||phi_t||^2)
+              + v_t phi_t^T
+        z_t = z_{t-1} + phi_t
         o_t = (W_t psi_t) / (z_t^T psi_t + eps)
 
-    We realize this with three fused Triton passes:
-      1) `d_t = z_{t-1}^T phi_t` via a sum-denominator pass and self-term removal.
-      2) Numerator recurrence via generalized DPLR delta-rule:
+    We realize this with two fused Triton passes:
+      1) Numerator recurrence via generalized DPLR delta-rule:
            S_t = S_{t-1} @ (I + a_t b_t^T) + v_t k_t^T
-         with `a_t = -phi_t / d_t`, `b_t = phi_t`, `k_t = phi_t`.
-      3) Final denominator `z_t^T psi_t` via sum-denominator pass with `2*phi_t`.
+         with `a_t = -beta_t * phi_t`, `b_t = phi_t`, `k_t = phi_t`,
+         `beta_t = (1-rho_t)/(||phi_t||^2 + forget_norm_eps)`.
+      2) Denominator `z_t^T psi_t` via simple additive recurrence (`z_t = z_{t-1}+phi_t`).
     """
     if q_prime.ndim != 4 or k_prime.ndim != 4 or v.ndim != 4:
         raise ValueError("q_prime, k_prime, v must have shape [B, T, H, D].")
@@ -68,6 +70,8 @@ def performer_plus_pdf_delta_attention_triton(
         raise ValueError(f"eps must be > 0, got {eps}.")
     if denom_eps <= 0:
         raise ValueError(f"denom_eps must be > 0, got {denom_eps}.")
+    if forget_norm_eps <= 0:
+        raise ValueError(f"forget_norm_eps must be > 0, got {forget_norm_eps}.")
     if chunk_dplr_delta_rule is None or fused_recurrent_simple_gla is None:
         raise RuntimeError("PDF delta Triton operator requires chunk_dplr_delta_rule and fused_recurrent_simple_gla.")
     if not _TRITON_AVAILABLE:
@@ -83,6 +87,18 @@ def performer_plus_pdf_delta_attention_triton(
     q_den_kernel = _to_kernel_dtype(q_prime_den, kernel_dtype)
     k_den_kernel = _to_kernel_dtype(k_prime_den, kernel_dtype)
     v_kernel = _to_kernel_dtype(v, kernel_dtype)
+    if rho is None:
+        rho_kernel = torch.zeros(
+            q_prime.shape[:3],
+            device=q_prime.device,
+            dtype=torch.float32,
+        )
+    else:
+        if rho.ndim != 3:
+            raise ValueError("rho must have shape [B, T, H].")
+        if rho.shape != q_prime.shape[:3]:
+            raise ValueError("rho shape must match q_prime[:, :, :, 0].")
+        rho_kernel = rho.float().clamp(0.0, 1.0).contiguous()
 
     initial_state_kv = None
     initial_state_k = None
@@ -104,72 +120,35 @@ def performer_plus_pdf_delta_attention_triton(
         if initial_state_kv.dtype != kernel_dtype:
             initial_state_kv = initial_state_kv.to(kernel_dtype)
 
-    # Pass 1: compute d_t = z_{t-1}^T phi_t.
-    # We get inclusive mass with z_{t-1} + 2*phi_t then remove the self term.
-    ones = torch.ones((*v_kernel.shape[:3], 1), device=v_kernel.device, dtype=kernel_dtype)
-    ones_twice = (2.0 * ones).contiguous()
-    den_init = None if initial_state_k is None else initial_state_k.unsqueeze(-1).to(kernel_dtype)
-    den_q = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
-    den_k = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
-    den_state = den_init.detach() if (denom_stopgrad and den_init is not None) else den_init
-    den_hist_inclusive, _ = fused_recurrent_simple_gla(
-        q=den_q,
-        k=den_k,
-        v=ones_twice,
-        g=None,
+    # Pass 1: numerator update via generalized DPLR delta recurrence.
+    k_norm_sq = k_num_kernel.float().square().sum(dim=-1).clamp_min(float(forget_norm_eps))
+    beta_pdf = ((1.0 - rho_kernel) / k_norm_sq).to(torch.float32)
+    a = -(beta_pdf.unsqueeze(-1).to(k_num_kernel.dtype) * k_num_kernel)
+    b = k_num_kernel
+    gk = torch.zeros_like(k_num_kernel)
+    num, kv_final = chunk_dplr_delta_rule(
+        q=q_num_kernel,
+        k=k_num_kernel,
+        v=v_kernel,
+        a=a,
+        b=b,
+        gk=gk,
         scale=1.0,
-        initial_state=den_state,
-        output_final_state=False,
+        initial_state=initial_state_kv,
+        output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
-    self_term_src = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
-    self_term = 2.0 * self_term_src.float().square().sum(dim=-1, keepdim=True)
-    den_prev_safe = (den_hist_inclusive.float() - self_term).clamp_min(float(denom_eps))
-    if denom_stopgrad:
-        den_prev_safe = den_prev_safe.detach()
 
-    # Pass 2: numerator update.
-    # Prefer the fused delta-rule kernel when available to reduce temporary
-    # tensors (a/b/gk in the DPLR formulation) and improve memory efficiency.
-    if fused_recurrent_delta_rule is not None:
-        beta_pdf = den_prev_safe.reciprocal().squeeze(-1).to(torch.float32)
-        v_pdf = v_kernel * den_prev_safe.to(v_kernel.dtype)
-        num, kv_final = fused_recurrent_delta_rule(
-            q=q_num_kernel,
-            k=k_num_kernel,
-            v=v_pdf,
-            beta=beta_pdf,
-            scale=1.0,
-            initial_state=initial_state_kv,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-            use_qk_l2norm_in_kernel=False,
-        )
-    else:
-        a = -(k_num_kernel.float() / den_prev_safe).to(k_num_kernel.dtype)
-        b = k_num_kernel
-        gk = torch.zeros_like(k_num_kernel)
-        num, kv_final = chunk_dplr_delta_rule(
-            q=q_num_kernel,
-            k=k_num_kernel,
-            v=v_kernel,
-            a=a,
-            b=b,
-            gk=gk,
-            scale=1.0,
-            initial_state=initial_state_kv,
-            output_final_state=output_final_state,
-            cu_seqlens=cu_seqlens,
-        )
-
-    # Pass 3: final denominator z_t^T psi_t with z_t = z_{t-1} + 2*phi_t.
+    # Pass 2: denominator z_t^T psi_t with z_t = z_{t-1} + phi_t.
+    ones = torch.ones((*v_kernel.shape[:3], 1), device=v_kernel.device, dtype=kernel_dtype)
     den_q_out = q_den_kernel.detach() if denom_stopgrad else q_den_kernel
     den_k_out = k_den_kernel.detach() if denom_stopgrad else k_den_kernel
+    den_init = None if initial_state_k is None else initial_state_k.unsqueeze(-1).to(kernel_dtype)
     den_state_out = den_init.detach() if (denom_stopgrad and den_init is not None) else den_init
     den_out, z_final = fused_recurrent_simple_gla(
         q=den_q_out,
         k=den_k_out,
-        v=ones_twice,
+        v=ones,
         g=None,
         scale=1.0,
         initial_state=den_state_out,

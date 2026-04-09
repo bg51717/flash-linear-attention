@@ -23,6 +23,9 @@ try:  # pragma: no cover
     from .linear_attention_performer_triton import performer_causal_linear_attention_triton  # noqa: F401
     from .linear_attention_performer_plus import PerformerPlusLinearAttention  # noqa: F401
     from .linear_attention_performer_plus_triton import performer_plus_causal_linear_attention_triton  # noqa: F401
+    from .dual_delta_net import DualDeltaNet  # noqa: F401
+    from .dual_delta_rule import fused_recurrent_dual_delta_rule  # noqa: F401
+    from .dual_delta_rule_naive import dual_delta_rule_naive  # noqa: F401
 except Exception:
     pass
 
