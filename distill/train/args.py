@@ -7,7 +7,7 @@ class ModelArguments:
     )
     linear_attention_type: str = field(
         default="gated_deltanet",
-        metadata={"help": "Type of attention mechanism to use, e.g. gated_deltanet, delta_net, dual_delta_net, first_order_linear_attention, pdf_final_linear_attention (or pdf_refined_linear_attention, final simplified recurrence from Approximating Self-attention.pdf), taylor_linear_attention (or softmax_taylor_linear_attention, using exp(q^T k) ~= 1 + q^T k), original_linear_attention (or vanilla_linear_attention, backed by FLA official LinearAttention with identity feature map), mha_attention (or mha, strict FLA official), mha_torch_attention (fallback), mha_torch_qk_unit_norm_attention (or mha_torch_qk_unit_norm, L2-normalize q/k to unit norm after q_proj/k_proj), performer_linear_attention, performer_plus_linear_attention."}
+        metadata={"help": "Type of attention mechanism to use, e.g. gated_deltanet, delta_net, dual_delta_net, mean_delta_net, approxnet_v2_linear_attention, first_order_linear_attention, pdf_final_linear_attention (or pdf_refined_linear_attention, final simplified recurrence from Approximating Self-attention.pdf), taylor_linear_attention (or softmax_taylor_linear_attention, using exp(q^T k) ~= 1 + q^T k), original_linear_attention (or vanilla_linear_attention, backed by FLA official LinearAttention with identity feature map), mha_attention (or mha, strict FLA official), mha_torch_attention (fallback), mha_torch_qk_unit_norm_attention (or mha_torch_qk_unit_norm, L2-normalize q/k to unit norm after q_proj/k_proj), performer_linear_attention, performer_plus_linear_attention."}
     )
     dual_delta_net_mode: str = field(
         default="fused_recurrent",
@@ -25,9 +25,225 @@ class ModelArguments:
         default=1.0e-6,
         metadata={"help": "Epsilon used by value L2 normalization in dual_delta_net."}
     )
+    mean_delta_net_mode: str = field(
+        default="fused_recurrent",
+        metadata={"help": "Kernel mode for mean_delta_net. Currently fused_recurrent is implemented."}
+    )
+    mean_recompute_chunk_size: int = field(
+        default=128,
+        metadata={"help": "Backward recompute chunk size for mean_delta_net. Smaller reduces backward peak memory."}
+    )
+    mean_delta_value_l2_norm: bool = field(
+        default=True,
+        metadata={"help": "Apply per-head L2 normalization to value states in mean_delta_net."}
+    )
+    mean_delta_value_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon used by value L2 normalization in mean_delta_net."}
+    )
     pdf_final_use_triton: bool = field(
         default=True,
         metadata={"help": "Use the Triton forward kernel for pdf_final_linear_attention when training without cache."}
+    )
+    approxnet_v2_use_triton: bool = field(
+        default=True,
+        metadata={"help": "Use Triton forward/backward kernels for approxnet_v2_linear_attention in dense training path."}
+    )
+    approxnet_v2_beta_denom_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Numerical epsilon added to approxnet-v2 beta denominator."}
+    )
+    approxnet_v2_score_clip: float = field(
+        default=20.0,
+        metadata={"help": "Clamp range for approxnet-v2 score k^T q before exp; <=0 disables clipping."}
+    )
+    approxnet_v2_qk_l2_norm: bool = field(
+        default=False,
+        metadata={"help": "Apply per-head L2 unit normalization to q/k after rotary in approxnet-v2."}
+    )
+    approxnet_v2_qk_l2_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon used by q/k L2 normalization in approxnet-v2."}
+    )
+    approxnet_v2_output_norm: str = field(
+        default="identity",
+        metadata={"help": "Output normalization for approxnet-v2 attention: identity or rmsnorm."}
+    )
+    approxnet_v2_recompute_chunk_size: int = field(
+        default=128,
+        metadata={"help": "Backward recompute chunk size for approxnet-v2 Triton backward."}
+    )
+    approxnet_v2_use_sigmoid_gate: bool = field(
+        default=False,
+        metadata={"help": "Use sigmoid gate for beta_t in approxnet-v2: beta=sigmoid(k^T q) instead of exp(score)/den."}
+    )
+    approxnet_v3_use_triton: bool = field(
+        default=True,
+        metadata={"help": "Use Triton forward/backward kernels for approxnet_v3_linear_attention in dense training path."}
+    )
+    approxnet_v3_beta_denom_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Numerical epsilon added to approxnet-v3 beta denominator."}
+    )
+    approxnet_v3_score_clip: float = field(
+        default=20.0,
+        metadata={"help": "Clamp range for approxnet-v3 score k^T q before exp; <=0 disables clipping."}
+    )
+    approxnet_v3_qk_l2_norm: bool = field(
+        default=False,
+        metadata={"help": "Apply per-head L2 unit normalization to q/k after rotary in approxnet-v3."}
+    )
+    approxnet_v3_qk_l2_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon used by q/k L2 normalization in approxnet-v3."}
+    )
+    approxnet_v3_output_norm: str = field(
+        default="identity",
+        metadata={"help": "Output normalization for approxnet-v3 attention: identity or rmsnorm."}
+    )
+    approxnet_v3_recompute_chunk_size: int = field(
+        default=128,
+        metadata={"help": "Backward recompute chunk size for approxnet-v3 Triton backward."}
+    )
+    approxnet_v3_use_sigmoid_gate: bool = field(
+        default=False,
+        metadata={"help": "Use sigmoid gate for beta_t in approxnet-v3: beta=sigmoid(k^T q) instead of exp(score)/den."}
+    )
+    approxnet_v4_use_triton: bool = field(
+        default=True,
+        metadata={"help": "Use Triton forward/backward kernels for approxnet_v4_linear_attention in dense training path."}
+    )
+    approxnet_v4_z_score_eps: float = field(
+        default=1.0,
+        metadata={"help": "Epsilon for z-score variance in approxnet-v4. Acts as baseline variance; smaller values (e.g. 1e-2) may work better with QK L2 norm."}
+    )
+    approxnet_v4_gate_alpha_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial value for per-head gate temperature alpha in approxnet-v4."}
+    )
+    approxnet_v4_gate_bias_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial value for per-head gate bias in approxnet-v4. sigmoid(bias) is the default gate value."}
+    )
+    approxnet_v4_qk_l2_norm: bool = field(
+        default=False,
+        metadata={"help": "Apply per-head L2 unit normalization to q/k after rotary in approxnet-v4."}
+    )
+    approxnet_v4_qk_l2_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon used by q/k L2 normalization in approxnet-v4."}
+    )
+    approxnet_v4_output_norm: str = field(
+        default="identity",
+        metadata={"help": "Output normalization for approxnet-v4 attention: identity or rmsnorm."}
+    )
+    approxnet_v4_recompute_chunk_size: int = field(
+        default=128,
+        metadata={"help": "Backward recompute chunk size for approxnet-v4 Triton backward."}
+    )
+    soam_d_r: int = field(
+        default=16,
+        metadata={"help": "Low-rank projection dimension for SOAM second-order associative memory."}
+    )
+    soam_decay_alpha_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial value for per-head decay gate score scale in SOAM. 0 means decay is score-independent."}
+    )
+    soam_decay_bias_init: float = field(
+        default=2.0,
+        metadata={"help": "Initial value for per-head decay gate bias in SOAM. sigmoid(2)≈0.88 retention."}
+    )
+    soam_write_alpha_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial value for per-head write gate score scale in SOAM."}
+    )
+    soam_write_bias_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial value for per-head write gate bias in SOAM. sigmoid(0)=0.5 default write rate."}
+    )
+    soam_qk_l2_norm: bool = field(
+        default=True,
+        metadata={"help": "Apply per-head L2 unit normalization to q/k before low-rank projection in SOAM."}
+    )
+    soam_qk_l2_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon used by q/k L2 normalization in SOAM."}
+    )
+    soam_output_norm: str = field(
+        default="identity",
+        metadata={"help": "Output normalization for SOAM attention: identity or rmsnorm."}
+    )
+    wla_d_r: int = field(
+        default=16,
+        metadata={"help": "Low-rank projection dimension for WLA."}
+    )
+    wla_decay_alpha_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial value for per-head decay gate score scale in WLA."}
+    )
+    wla_decay_bias_init: float = field(
+        default=2.0,
+        metadata={"help": "Initial value for per-head decay gate bias in WLA."}
+    )
+    wla_write_alpha_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial value for per-head write gate score scale in WLA."}
+    )
+    wla_write_bias_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial value for per-head write gate bias in WLA."}
+    )
+    wla_qk_l2_norm: bool = field(
+        default=True,
+        metadata={"help": "Apply per-head L2 unit normalization to q/k in WLA."}
+    )
+    wla_qk_l2_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon for q/k L2 normalization in WLA."}
+    )
+    wla_output_norm: str = field(
+        default="identity",
+        metadata={"help": "Output normalization for WLA: identity or rmsnorm."}
+    )
+    wla_sigma2_init: float = field(
+        default=5.0,
+        metadata={"help": "Initial sigma^2 for Wiener regularization in WLA."}
+    )
+    sisa_d_r: int = field(
+        default=16,
+        metadata={"help": "Low-rank projection dimension for SiSA."}
+    )
+    sisa_decay_alpha_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial value for per-head decay gate score scale in SiSA."}
+    )
+    sisa_decay_bias_init: float = field(
+        default=2.0,
+        metadata={"help": "Initial value for per-head decay gate bias in SiSA."}
+    )
+    sisa_write_alpha_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial value for per-head write gate score scale in SiSA."}
+    )
+    sisa_write_bias_init: float = field(
+        default=0.0,
+        metadata={"help": "Initial value for per-head write gate bias in SiSA."}
+    )
+    sisa_qk_l2_norm: bool = field(
+        default=True,
+        metadata={"help": "Apply per-head L2 unit normalization to q/k in SiSA."}
+    )
+    sisa_qk_l2_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon for q/k L2 normalization in SiSA."}
+    )
+    sisa_output_norm: str = field(
+        default="identity",
+        metadata={"help": "Output normalization for SiSA: identity or rmsnorm."}
+    )
+    sisa_beta_init: float = field(
+        default=1.0,
+        metadata={"help": "Initial softmax temperature beta for SiSA (stored as log_beta = log(beta_init))."}
     )
     performer_nb_features: int = field(
         default=None,

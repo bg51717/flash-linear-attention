@@ -43,6 +43,18 @@ utils_files = {
     "models/linear_attention_pdf_final.py",
     "models/linear_attention_pdf_final_triton.py",
     "models/linear_attention_taylor.py",
+    "models/linear_attention_approxnet_v2.py",
+    "models/linear_attention_approxnet_v2_triton.py",
+    "models/linear_attention_approxnet_v3.py",
+    "models/linear_attention_approxnet_v3_triton.py",
+    "models/linear_attention_approxnet_v4.py",
+    "models/linear_attention_approxnet_v4_triton.py",
+    "models/linear_attention_soam.py",
+    "models/linear_attention_soam_triton.py",
+    "models/linear_attention_wla.py",
+    "models/linear_attention_wla_triton.py",
+    "models/linear_attention_sisa.py",
+    "models/linear_attention_sisa_triton.py",
     "models/linear_attention_performer.py",
     "models/linear_attention_performer_triton.py",
     "models/linear_attention_performer_plus.py",
@@ -52,6 +64,9 @@ utils_files = {
     "models/dual_delta_rule_naive.py",
     "models/dual_delta_rule.py",
     "models/dual_delta_net.py",
+    "models/mean_delta_rule_naive.py",
+    "models/mean_delta_rule.py",
+    "models/mean_delta_net.py",
 }
 
 
@@ -272,6 +287,64 @@ def load_model_tokenizer(model_args):
         tokenizer.pad_token = tokenizer.eos_token
     config = model.config
     config.linear_attention_type = model_args.linear_attention_type
+    config.dual_delta_net_mode = model_args.dual_delta_net_mode
+    config.dual_recompute_chunk_size = model_args.dual_recompute_chunk_size
+    config.dual_delta_value_l2_norm = model_args.dual_delta_value_l2_norm
+    config.dual_delta_value_norm_eps = model_args.dual_delta_value_norm_eps
+    config.mean_delta_net_mode = model_args.mean_delta_net_mode
+    config.mean_recompute_chunk_size = model_args.mean_recompute_chunk_size
+    config.mean_delta_value_l2_norm = model_args.mean_delta_value_l2_norm
+    config.mean_delta_value_norm_eps = model_args.mean_delta_value_norm_eps
+    config.approxnet_v2_use_triton = model_args.approxnet_v2_use_triton
+    config.approxnet_v2_beta_denom_eps = model_args.approxnet_v2_beta_denom_eps
+    config.approxnet_v2_score_clip = model_args.approxnet_v2_score_clip
+    config.approxnet_v2_qk_l2_norm = model_args.approxnet_v2_qk_l2_norm
+    config.approxnet_v2_qk_l2_norm_eps = model_args.approxnet_v2_qk_l2_norm_eps
+    config.approxnet_v2_output_norm = model_args.approxnet_v2_output_norm
+    config.approxnet_v2_recompute_chunk_size = model_args.approxnet_v2_recompute_chunk_size
+    config.approxnet_v2_use_sigmoid_gate = model_args.approxnet_v2_use_sigmoid_gate
+    config.approxnet_v3_use_triton = model_args.approxnet_v3_use_triton
+    config.approxnet_v3_beta_denom_eps = model_args.approxnet_v3_beta_denom_eps
+    config.approxnet_v3_score_clip = model_args.approxnet_v3_score_clip
+    config.approxnet_v3_qk_l2_norm = model_args.approxnet_v3_qk_l2_norm
+    config.approxnet_v3_qk_l2_norm_eps = model_args.approxnet_v3_qk_l2_norm_eps
+    config.approxnet_v3_output_norm = model_args.approxnet_v3_output_norm
+    config.approxnet_v3_recompute_chunk_size = model_args.approxnet_v3_recompute_chunk_size
+    config.approxnet_v3_use_sigmoid_gate = model_args.approxnet_v3_use_sigmoid_gate
+    config.approxnet_v4_use_triton = model_args.approxnet_v4_use_triton
+    config.approxnet_v4_z_score_eps = model_args.approxnet_v4_z_score_eps
+    config.approxnet_v4_gate_alpha_init = model_args.approxnet_v4_gate_alpha_init
+    config.approxnet_v4_gate_bias_init = model_args.approxnet_v4_gate_bias_init
+    config.approxnet_v4_qk_l2_norm = model_args.approxnet_v4_qk_l2_norm
+    config.approxnet_v4_qk_l2_norm_eps = model_args.approxnet_v4_qk_l2_norm_eps
+    config.approxnet_v4_output_norm = model_args.approxnet_v4_output_norm
+    config.approxnet_v4_recompute_chunk_size = model_args.approxnet_v4_recompute_chunk_size
+    config.soam_d_r = model_args.soam_d_r
+    config.soam_decay_alpha_init = model_args.soam_decay_alpha_init
+    config.soam_decay_bias_init = model_args.soam_decay_bias_init
+    config.soam_write_alpha_init = model_args.soam_write_alpha_init
+    config.soam_write_bias_init = model_args.soam_write_bias_init
+    config.soam_qk_l2_norm = model_args.soam_qk_l2_norm
+    config.soam_qk_l2_norm_eps = model_args.soam_qk_l2_norm_eps
+    config.soam_output_norm = model_args.soam_output_norm
+    config.wla_d_r = model_args.wla_d_r
+    config.wla_decay_alpha_init = model_args.wla_decay_alpha_init
+    config.wla_decay_bias_init = model_args.wla_decay_bias_init
+    config.wla_write_alpha_init = model_args.wla_write_alpha_init
+    config.wla_write_bias_init = model_args.wla_write_bias_init
+    config.wla_qk_l2_norm = model_args.wla_qk_l2_norm
+    config.wla_qk_l2_norm_eps = model_args.wla_qk_l2_norm_eps
+    config.wla_output_norm = model_args.wla_output_norm
+    config.wla_sigma2_init = model_args.wla_sigma2_init
+    config.sisa_d_r = model_args.sisa_d_r
+    config.sisa_decay_alpha_init = model_args.sisa_decay_alpha_init
+    config.sisa_decay_bias_init = model_args.sisa_decay_bias_init
+    config.sisa_write_alpha_init = model_args.sisa_write_alpha_init
+    config.sisa_write_bias_init = model_args.sisa_write_bias_init
+    config.sisa_qk_l2_norm = model_args.sisa_qk_l2_norm
+    config.sisa_qk_l2_norm_eps = model_args.sisa_qk_l2_norm_eps
+    config.sisa_output_norm = model_args.sisa_output_norm
+    config.sisa_beta_init = model_args.sisa_beta_init
     config.performer_nb_features = model_args.performer_nb_features
     config.performer_redraw_projection = model_args.performer_redraw_projection
     config.performer_projection_seed = model_args.performer_projection_seed
@@ -421,6 +494,46 @@ def main():
         for key, value in settings[model_type].items():
             setattr(config, key, value)
         config.linear_attention_type = args.model.linear_attention_type
+        config.dual_delta_net_mode = args.model.dual_delta_net_mode
+        config.dual_recompute_chunk_size = args.model.dual_recompute_chunk_size
+        config.dual_delta_value_l2_norm = args.model.dual_delta_value_l2_norm
+        config.dual_delta_value_norm_eps = args.model.dual_delta_value_norm_eps
+        config.mean_delta_net_mode = args.model.mean_delta_net_mode
+        config.mean_recompute_chunk_size = args.model.mean_recompute_chunk_size
+        config.mean_delta_value_l2_norm = args.model.mean_delta_value_l2_norm
+        config.mean_delta_value_norm_eps = args.model.mean_delta_value_norm_eps
+        config.approxnet_v2_use_triton = args.model.approxnet_v2_use_triton
+        config.approxnet_v2_beta_denom_eps = args.model.approxnet_v2_beta_denom_eps
+        config.approxnet_v2_score_clip = args.model.approxnet_v2_score_clip
+        config.approxnet_v2_qk_l2_norm = args.model.approxnet_v2_qk_l2_norm
+        config.approxnet_v2_qk_l2_norm_eps = args.model.approxnet_v2_qk_l2_norm_eps
+        config.approxnet_v2_output_norm = args.model.approxnet_v2_output_norm
+        config.approxnet_v2_recompute_chunk_size = args.model.approxnet_v2_recompute_chunk_size
+        config.approxnet_v2_use_sigmoid_gate = args.model.approxnet_v2_use_sigmoid_gate
+        config.approxnet_v3_use_triton = args.model.approxnet_v3_use_triton
+        config.approxnet_v3_beta_denom_eps = args.model.approxnet_v3_beta_denom_eps
+        config.approxnet_v3_score_clip = args.model.approxnet_v3_score_clip
+        config.approxnet_v3_qk_l2_norm = args.model.approxnet_v3_qk_l2_norm
+        config.approxnet_v3_qk_l2_norm_eps = args.model.approxnet_v3_qk_l2_norm_eps
+        config.approxnet_v3_output_norm = args.model.approxnet_v3_output_norm
+        config.approxnet_v3_recompute_chunk_size = args.model.approxnet_v3_recompute_chunk_size
+        config.approxnet_v3_use_sigmoid_gate = args.model.approxnet_v3_use_sigmoid_gate
+        config.approxnet_v4_use_triton = args.model.approxnet_v4_use_triton
+        config.approxnet_v4_z_score_eps = args.model.approxnet_v4_z_score_eps
+        config.approxnet_v4_gate_alpha_init = args.model.approxnet_v4_gate_alpha_init
+        config.approxnet_v4_gate_bias_init = args.model.approxnet_v4_gate_bias_init
+        config.approxnet_v4_qk_l2_norm = args.model.approxnet_v4_qk_l2_norm
+        config.approxnet_v4_qk_l2_norm_eps = args.model.approxnet_v4_qk_l2_norm_eps
+        config.approxnet_v4_output_norm = args.model.approxnet_v4_output_norm
+        config.approxnet_v4_recompute_chunk_size = args.model.approxnet_v4_recompute_chunk_size
+        config.soam_d_r = args.model.soam_d_r
+        config.soam_decay_alpha_init = args.model.soam_decay_alpha_init
+        config.soam_decay_bias_init = args.model.soam_decay_bias_init
+        config.soam_write_alpha_init = args.model.soam_write_alpha_init
+        config.soam_write_bias_init = args.model.soam_write_bias_init
+        config.soam_qk_l2_norm = args.model.soam_qk_l2_norm
+        config.soam_qk_l2_norm_eps = args.model.soam_qk_l2_norm_eps
+        config.soam_output_norm = args.model.soam_output_norm
         config.performer_nb_features = args.model.performer_nb_features
         config.performer_redraw_projection = args.model.performer_redraw_projection
         config.performer_projection_seed = args.model.performer_projection_seed
