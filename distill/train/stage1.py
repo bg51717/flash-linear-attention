@@ -646,8 +646,11 @@ def main():
             target_path = save_dir / item
             shutil.copy(source_path, target_path)
         for utils_file in utils_files:
+            src_path = current_dir / utils_file
+            if not src_path.exists():
+                continue
             file_name = utils_file.split("/")[-1]
-            shutil.copy(current_dir / utils_file, save_dir / file_name)
+            shutil.copy(src_path, save_dir / file_name)
         _validate_remote_code_export(save_dir)
         print(f"Model saved to {save_dir}")
 

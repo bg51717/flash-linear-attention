@@ -20,7 +20,7 @@ if _ROOT not in sys.path:
 
 _IMPORT_ERROR: Exception | None = None
 try:
-    from distill.models.linear_attention_taylor import TaylorLinearAttention
+    from fla.layers.taylor import TaylorLinearAttention
     from distill.models.utils import init_attention_module
 except Exception as exc:  # pragma: no cover
     _IMPORT_ERROR = exc

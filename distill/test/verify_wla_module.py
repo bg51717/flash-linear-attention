@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import torch
 import torch.nn.functional as F
 
-from distill.models.linear_attention_wla import (
+from fla.layers.wla import (
     wla_recurrence_naive,
     _fused_recurrent_wla,
     WLALinearAttention,

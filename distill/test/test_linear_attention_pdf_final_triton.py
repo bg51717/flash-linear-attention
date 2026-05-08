@@ -14,8 +14,8 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from distill.models.linear_attention_pdf_final import pdf_final_linear_attention
-from distill.models.linear_attention_pdf_final_triton import (
+from fla.layers.pdf_final import pdf_final_linear_attention
+from fla.ops.pdf_final.fused_recurrent import (
     _TRITON_AVAILABLE,
     pdf_final_linear_attention_triton,
 )

@@ -30,6 +30,21 @@ from .rebased import ReBasedLinearAttention
 from .rodimus import RodimusAttention, SlidingWindowSharedKeyAttention
 from .rwkv6 import RWKV6Attention
 from .rwkv7 import RWKV7Attention
+from .sisa import SiSALinearAttention
+from .soam import SOAMLinearAttention
+from .wla import WLALinearAttention
+from .pdf import FirstOrderLinearAttention
+from .pdf_final import PDFFinalLinearAttention
+from .taylor import TaylorLinearAttention
+from .approxnet_v2 import ApproxNetV2LinearAttention
+from .approxnet_v3 import ApproxNetV3LinearAttention
+from .approxnet_v4 import ApproxNetV4LinearAttention
+from .performer import PerformerLinearAttention
+from .performer_plus import PerformerPlusLinearAttention
+from .dual_delta_net import DualDeltaNet as DualDeltaNetCustom
+from .hpk import HPKLinearAttention
+from .sqk import SQKLinearAttention
+from .mean_delta_net import MeanDeltaNet as MeanDeltaNetCustom
 
 __all__ = [
     'ABCAttention',
@@ -63,4 +78,19 @@ __all__ = [
     'RWKV7Attention',
     'SlidingWindowSharedKeyAttention',
     'DeltaFormerAttention',
+    'SiSALinearAttention',
+    'SOAMLinearAttention',
+    'WLALinearAttention',
+    'FirstOrderLinearAttention',
+    'PDFFinalLinearAttention',
+    'TaylorLinearAttention',
+    'ApproxNetV2LinearAttention',
+    'ApproxNetV3LinearAttention',
+    'ApproxNetV4LinearAttention',
+    'PerformerLinearAttention',
+    'PerformerPlusLinearAttention',
+    'DualDeltaNetCustom',
+    'HPKLinearAttention',
+    'SQKLinearAttention',
+    'MeanDeltaNetCustom',
 ]

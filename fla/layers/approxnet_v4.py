@@ -13,9 +13,9 @@ from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
 from fla.ops.utils.index import prepare_lens_from_mask
 
 try:
-    from .linear_attention_approxnet_v4_triton import (
+    from fla.ops.approxnet_v4 import approxnet_v4_linear_attention_triton
+    from fla.ops.approxnet_v4.fused_recurrent import (
         _TRITON_AVAILABLE as _APPROXNET_V4_TRITON_AVAILABLE,
-        approxnet_v4_linear_attention_triton,
     )
 except Exception:  # pragma: no cover
     _APPROXNET_V4_TRITON_AVAILABLE = False

@@ -16,7 +16,7 @@ if _ROOT not in sys.path:
 
 _IMPORT_ERROR: Exception | None = None
 try:
-    from distill.models.linear_attention_soam import (
+    from fla.layers.soam import (
         SOAMLinearAttention,
         soam_linear_attention,
         soam_recurrence_naive,
@@ -225,7 +225,7 @@ def _run_triton_vs_naive_case() -> None:
         print("  [skip] triton vs naive (no CUDA)")
         return
     try:
-        from distill.models.linear_attention_soam_triton import fused_recurrent_soam  # noqa: F401
+        from fla.ops.soam.fused_recurrent import fused_recurrent_soam  # noqa: F401
     except ImportError:
         print("  [skip] triton vs naive (triton not available)")
         return
@@ -262,7 +262,7 @@ def _run_triton_gradient_case() -> None:
         print("  [skip] triton gradient (no CUDA)")
         return
     try:
-        from distill.models.linear_attention_soam_triton import fused_recurrent_soam  # noqa: F401
+        from fla.ops.soam.fused_recurrent import fused_recurrent_soam  # noqa: F401
     except ImportError:
         print("  [skip] triton gradient (triton not available)")
         return

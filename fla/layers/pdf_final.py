@@ -13,9 +13,9 @@ from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
 from fla.ops.utils.index import prepare_lens_from_mask
 
 try:
-    from .linear_attention_pdf_final_triton import (
+    from fla.ops.pdf_final import pdf_final_linear_attention_triton
+    from fla.ops.pdf_final.fused_recurrent import (
         _TRITON_AVAILABLE as _PDF_FINAL_TRITON_AVAILABLE,
-        pdf_final_linear_attention_triton,
     )
 except Exception:  # pragma: no cover
     _PDF_FINAL_TRITON_AVAILABLE = False

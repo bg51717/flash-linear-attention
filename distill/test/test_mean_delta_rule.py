@@ -16,9 +16,9 @@ if _ROOT not in sys.path:
 
 _IMPORT_ERROR: Exception | None = None
 try:
-    from distill.models.mean_delta_net import MeanDeltaNet
-    from distill.models.mean_delta_rule import fused_recurrent_mean_delta_rule
-    from distill.models.mean_delta_rule_naive import mean_delta_rule_recurrence
+    from fla.layers.mean_delta_net import MeanDeltaNet
+    from fla.ops.mean_delta_rule.fused_recurrent import fused_recurrent_mean_delta_rule
+    from fla.ops.mean_delta_rule.naive import mean_delta_rule_recurrence
 except Exception as exc:  # pragma: no cover
     _IMPORT_ERROR = exc
     MeanDeltaNet = None

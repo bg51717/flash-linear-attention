@@ -11,7 +11,7 @@ import triton.language as tl
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 from fla.utils import input_guard
 
-from .mean_delta_rule_naive import mean_delta_rule_recurrence
+from .naive import mean_delta_rule_recurrence
 
 
 @triton.heuristics({

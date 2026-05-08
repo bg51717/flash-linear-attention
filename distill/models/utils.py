@@ -12,19 +12,22 @@ except Exception:  # pragma: no cover
     FLAAttention = None
     _FLA_ATTENTION_AVAILABLE = False
 
-from .linear_attention_pdf import FirstOrderLinearAttention
-from .linear_attention_pdf_final import PDFFinalLinearAttention
-from .linear_attention_performer import PerformerLinearAttention
-from .linear_attention_performer_plus import PerformerPlusLinearAttention
-from .linear_attention_taylor import TaylorLinearAttention
-from .linear_attention_approxnet_v2 import ApproxNetV2LinearAttention
-from .linear_attention_approxnet_v3 import ApproxNetV3LinearAttention
-from .linear_attention_approxnet_v4 import ApproxNetV4LinearAttention
-from .linear_attention_soam import SOAMLinearAttention
-from .linear_attention_wla import WLALinearAttention
-from .linear_attention_sisa import SiSALinearAttention
-from .dual_delta_net import DualDeltaNet
-from .mean_delta_net import MeanDeltaNet
+from fla.layers.pdf import FirstOrderLinearAttention
+from fla.layers.pdf_final import PDFFinalLinearAttention
+from fla.layers.performer import PerformerLinearAttention
+from fla.layers.performer_plus import PerformerPlusLinearAttention
+from fla.layers.taylor import TaylorLinearAttention
+from fla.layers.approxnet_v2 import ApproxNetV2LinearAttention
+from fla.layers.approxnet_v3 import ApproxNetV3LinearAttention
+from fla.layers.approxnet_v4 import ApproxNetV4LinearAttention
+from fla.layers.soam import SOAMLinearAttention
+from fla.layers.wla import WLALinearAttention
+from fla.layers.sisa import SiSALinearAttention
+from fla.layers.dual_delta_net import DualDeltaNet
+from fla.layers.hpk import HPKLinearAttention
+from fla.layers.sqk import SQKLinearAttention
+from fla.layers.css import CSSLinearAttention
+from fla.layers.mean_delta_net import MeanDeltaNet
 
 
 class TorchMHAAttention(nn.Module):
@@ -199,6 +202,12 @@ TYPE2ATTN = {
     "mha_torch_qk_unit_norm": TorchMHAAttention,
     "performer_linear_attention": PerformerLinearAttention,
     "performer_plus_linear_attention": PerformerPlusLinearAttention,
+    "hpk_linear_attention": HPKLinearAttention,
+    "hpk": HPKLinearAttention,
+    "sqk_linear_attention": SQKLinearAttention,
+    "sqk": SQKLinearAttention,
+    "css_linear_attention": CSSLinearAttention,
+    "css": CSSLinearAttention,
 }
 
 CONFIG2KWARGS = {
@@ -934,6 +943,146 @@ CONFIG2KWARGS = {
         "performer_learnable_kernel_scale": lambda cfg: getattr(cfg, "performer_learnable_kernel_scale", True),
         "performer_kernel_scale_init": lambda cfg: getattr(cfg, "performer_kernel_scale_init", 1.0),
     },
+    "hpk_linear_attention": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_kv_heads": lambda cfg: getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "output_norm": lambda cfg: getattr(cfg, "hpk_output_norm", "identity"),
+        "qkv_bias": lambda cfg: getattr(cfg, "attention_bias", False),
+        "rope_theta": lambda cfg: getattr(cfg, "rope_theta", 10000.0),
+        "max_position_embeddings": lambda cfg: getattr(cfg, "max_position_embeddings", None),
+        "feature_dim": lambda cfg: getattr(cfg, "hpk_feature_dim", 64),
+        "power_order": lambda cfg: getattr(cfg, "hpk_power_order", 2),
+        "decay_init": lambda cfg: getattr(cfg, "hpk_decay_init", 4.0),
+        "denom_eps": lambda cfg: getattr(cfg, "hpk_denom_eps", 1e-6),
+        "qk_l2_norm": lambda cfg: getattr(cfg, "hpk_qk_l2_norm", True),
+        "qk_l2_norm_eps": lambda cfg: getattr(cfg, "hpk_qk_l2_norm_eps", 1e-6),
+    },
+    "hpk": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_kv_heads": lambda cfg: getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "output_norm": lambda cfg: getattr(cfg, "hpk_output_norm", "identity"),
+        "qkv_bias": lambda cfg: getattr(cfg, "attention_bias", False),
+        "rope_theta": lambda cfg: getattr(cfg, "rope_theta", 10000.0),
+        "max_position_embeddings": lambda cfg: getattr(cfg, "max_position_embeddings", None),
+        "feature_dim": lambda cfg: getattr(cfg, "hpk_feature_dim", 64),
+        "power_order": lambda cfg: getattr(cfg, "hpk_power_order", 2),
+        "decay_init": lambda cfg: getattr(cfg, "hpk_decay_init", 4.0),
+        "denom_eps": lambda cfg: getattr(cfg, "hpk_denom_eps", 1e-6),
+        "qk_l2_norm": lambda cfg: getattr(cfg, "hpk_qk_l2_norm", True),
+        "qk_l2_norm_eps": lambda cfg: getattr(cfg, "hpk_qk_l2_norm_eps", 1e-6),
+    },
+    "sqk_linear_attention": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_kv_heads": lambda cfg: getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "output_norm": lambda cfg: getattr(cfg, "sqk_output_norm", "identity"),
+        "qkv_bias": lambda cfg: getattr(cfg, "attention_bias", False),
+        "rope_theta": lambda cfg: getattr(cfg, "rope_theta", 10000.0),
+        "max_position_embeddings": lambda cfg: getattr(cfg, "max_position_embeddings", None),
+        "proj_rank": lambda cfg: getattr(cfg, "sqk_proj_rank", 16),
+        "decay_init": lambda cfg: getattr(cfg, "sqk_decay_init", 4.0),
+        "denom_eps": lambda cfg: getattr(cfg, "sqk_denom_eps", 1e-6),
+        "qk_l2_norm": lambda cfg: getattr(cfg, "sqk_qk_l2_norm", True),
+        "qk_l2_norm_eps": lambda cfg: getattr(cfg, "sqk_qk_l2_norm_eps", 1e-6),
+    },
+    "sqk": {
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_kv_heads": lambda cfg: getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "output_norm": lambda cfg: getattr(cfg, "sqk_output_norm", "identity"),
+        "qkv_bias": lambda cfg: getattr(cfg, "attention_bias", False),
+        "rope_theta": lambda cfg: getattr(cfg, "rope_theta", 10000.0),
+        "max_position_embeddings": lambda cfg: getattr(cfg, "max_position_embeddings", None),
+        "proj_rank": lambda cfg: getattr(cfg, "sqk_proj_rank", 16),
+        "decay_init": lambda cfg: getattr(cfg, "sqk_decay_init", 4.0),
+        "denom_eps": lambda cfg: getattr(cfg, "sqk_denom_eps", 1e-6),
+        "qk_l2_norm": lambda cfg: getattr(cfg, "sqk_qk_l2_norm", True),
+        "qk_l2_norm_eps": lambda cfg: getattr(cfg, "sqk_qk_l2_norm_eps", 1e-6),
+    },
+    "css_linear_attention": {
+        "mode": lambda cfg: getattr(cfg, "css_mode", "fused_chunk"),
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_kv_heads": lambda cfg: getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "output_norm": lambda cfg: getattr(cfg, "css_output_norm", "identity"),
+        "qkv_bias": lambda cfg: getattr(cfg, "attention_bias", False),
+        "rope_theta": lambda cfg: getattr(cfg, "rope_theta", 10000.0),
+        "max_position_embeddings": lambda cfg: getattr(cfg, "max_position_embeddings", None),
+        "proj_rank": lambda cfg: getattr(cfg, "css_proj_rank", 22),
+        "decay_init": lambda cfg: getattr(cfg, "css_decay_init", 4.0),
+        "denom_eps": lambda cfg: getattr(cfg, "css_denom_eps", 1e-6),
+        "proj_normalize": lambda cfg: getattr(cfg, "css_proj_normalize", True),
+        "proj_norm_eps": lambda cfg: getattr(cfg, "css_proj_norm_eps", 1e-6),
+        "qk_l2_norm": lambda cfg: getattr(cfg, "css_qk_l2_norm", True),
+        "qk_l2_norm_eps": lambda cfg: getattr(cfg, "css_qk_l2_norm_eps", 1e-6),
+    },
+    "css": {
+        "mode": lambda cfg: getattr(cfg, "css_mode", "fused_chunk"),
+        "hidden_size": "hidden_size",
+        "num_heads": "num_attention_heads",
+        "norm_eps": "rms_norm_eps",
+        "head_dim": lambda cfg: getattr(
+            cfg, "head_dim", cfg.hidden_size // cfg.num_attention_heads
+        ),
+        "num_kv_heads": lambda cfg: getattr(cfg, "num_key_value_heads", cfg.num_attention_heads),
+        "expand_v": lambda cfg: getattr(cfg, "expand_v", 1.0),
+        "use_short_conv": lambda cfg: getattr(cfg, "use_short_conv", True),
+        "conv_size": lambda cfg: getattr(cfg, "conv_size", 4),
+        "conv_bias": lambda cfg: getattr(cfg, "conv_bias", False),
+        "output_norm": lambda cfg: getattr(cfg, "css_output_norm", "identity"),
+        "qkv_bias": lambda cfg: getattr(cfg, "attention_bias", False),
+        "rope_theta": lambda cfg: getattr(cfg, "rope_theta", 10000.0),
+        "max_position_embeddings": lambda cfg: getattr(cfg, "max_position_embeddings", None),
+        "proj_rank": lambda cfg: getattr(cfg, "css_proj_rank", 22),
+        "decay_init": lambda cfg: getattr(cfg, "css_decay_init", 4.0),
+        "denom_eps": lambda cfg: getattr(cfg, "css_denom_eps", 1e-6),
+        "proj_normalize": lambda cfg: getattr(cfg, "css_proj_normalize", True),
+        "proj_norm_eps": lambda cfg: getattr(cfg, "css_proj_norm_eps", 1e-6),
+        "qk_l2_norm": lambda cfg: getattr(cfg, "css_qk_l2_norm", True),
+        "qk_l2_norm_eps": lambda cfg: getattr(cfg, "css_qk_l2_norm_eps", 1e-6),
+    },
 }
 
 
@@ -1008,6 +1157,12 @@ def _initialize_from_source(
         "wla",
         "sisa_linear_attention",
         "sisa",
+        "hpk_linear_attention",
+        "hpk",
+        "sqk_linear_attention",
+        "sqk",
+        "css_linear_attention",
+        "css",
     }:
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
             _copy_linear_if_compatible(module, source_attn, name)
@@ -1044,6 +1199,12 @@ def init_attention_module(config, layer_idx: int, source_attn: nn.Module | None 
             "wla",
             "sisa_linear_attention",
             "sisa",
+            "hpk_linear_attention",
+            "hpk",
+            "sqk_linear_attention",
+            "sqk",
+            "css_linear_attention",
+            "css",
         }:
             keep_norm = _attention_has_norm(source_attn)
             attn_kwargs["output_norm"] = "rmsnorm" if keep_norm else "identity"

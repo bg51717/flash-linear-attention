@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,7 +18,7 @@ if TYPE_CHECKING:
 
 _TRITON_AVAILABLE = False
 try:
-    from .linear_attention_wla_triton import fused_recurrent_wla
+    from fla.ops.soam import fused_recurrent_soam
     _TRITON_AVAILABLE = True
 except ImportError:
     pass
@@ -27,10 +26,10 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Naive reference (for testing only, not for training)
-# Matches fla convention: inputs are [B, H, T, D]
+# Matches fla/ops/delta_rule/naive.py convention: inputs are [B, H, T, D]
 # ---------------------------------------------------------------------------
 
-def wla_recurrence_naive(
+def soam_recurrence_naive(
     q_r: torch.Tensor,
     k_r: torch.Tensor,
     v: torch.Tensor,
@@ -38,10 +37,9 @@ def wla_recurrence_naive(
     decay_bias: torch.Tensor,
     write_alpha: torch.Tensor,
     write_bias: torch.Tensor,
-    log_sigma2: torch.Tensor,
-    initial_state: tuple[torch.Tensor, ...] | None = None,
+    initial_state: torch.Tensor | None = None,
     output_final_state: bool = True,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """
     Pure PyTorch reference. For correctness verification only.
 
@@ -50,11 +48,10 @@ def wla_recurrence_naive(
         k_r: [B, H, T, d_r]
         v:   [B, H, T, d_v]
         decay_alpha, decay_bias, write_alpha, write_bias: [H]
-        log_sigma2: [H]
-        initial_state: (S[B,H,d_r,d_v], G[B,H,d_r,d_r]) or None
+        initial_state: [B, H, d_r, d_r, d_v] or None
     Returns:
         o: [B, H, T, d_v]
-        final_state: (S, G) or None
+        final_state: [B, H, d_r, d_r, d_v] or None
     """
     orig_dtype = q_r.dtype
     b, h, t, d_r = q_r.shape
@@ -62,42 +59,32 @@ def wla_recurrence_naive(
     q_r, k_r, v = q_r.float(), k_r.float(), v.float()
     da, db = decay_alpha.float(), decay_bias.float()
     wa, wb = write_alpha.float(), write_bias.float()
-    sigma2 = torch.exp(log_sigma2.float())
 
     o = torch.zeros_like(v)
-    S = torch.zeros(b, h, d_r, d_v, device=q_r.device, dtype=torch.float32)
-    G = torch.zeros(b, h, d_r, d_r, device=q_r.device, dtype=torch.float32)
+    T = torch.zeros(b, h, d_r, d_r, d_v, device=q_r.device, dtype=torch.float32)
     if initial_state is not None:
-        S = S + initial_state[0].float()
-        G = G + initial_state[1].float()
-
-    eye = torch.eye(d_r, device=q_r.device, dtype=torch.float32)
+        T = T + initial_state.float()
 
     for i in range(t):
-        q_i = q_r[:, :, i]
+        q_i = q_r[:, :, i]   # (b, h, d_r)
         k_i = k_r[:, :, i]
-        v_i = v[:, :, i]
+        v_i = v[:, :, i]     # (b, h, d_v)
 
-        score = (k_i * q_i).sum(-1)
-        alpha = torch.sigmoid(da * score + db)
-        beta = torch.sigmoid(wa * score + wb)
+        score = (k_i * q_i).sum(-1)  # (b, h)
+        alpha = torch.sigmoid(da * score + db)[:, :, None, None, None]
+        beta = torch.sigmoid(wa * score + wb)[:, :, None, None, None]
 
-        a_S = alpha[:, :, None, None]
-        b_S = beta[:, :, None, None]
-        S = a_S * S + b_S * (k_i[:, :, :, None] * v_i[:, :, None, :])
+        Tk = (T * k_i[:, :, None, :, None]).sum(3)       # (b, h, d_r, d_v)
+        retrieval = (Tk * k_i[:, :, :, None]).sum(2)      # (b, h, d_v)
 
-        a_G = alpha[:, :, None, None]
-        b_G = beta[:, :, None, None]
-        G = a_G * G + b_G * (k_i[:, :, :, None] * k_i[:, :, None, :])
+        error = v_i - retrieval
+        kk = k_i[:, :, :, None] * k_i[:, :, None, :]     # (b, h, d_r, d_r)
+        T = alpha * T + beta * (kk.unsqueeze(-1) * error[:, :, None, None, :])
 
-        G_reg = G.detach() + sigma2[None, :, None, None] * eye
-        q_w = torch.linalg.solve(G_reg, q_i.unsqueeze(-1)).squeeze(-1)
-        q_n = F.normalize(q_w, p=2, dim=-1)
+        Tq = (T * q_i[:, :, None, :, None]).sum(3)
+        o[:, :, i] = (Tq * q_i[:, :, :, None]).sum(2)
 
-        o[:, :, i] = torch.einsum('bhrd,bhr->bhd', S, q_n)
-
-    final = (S, G) if output_final_state else None
-    return o.to(orig_dtype), final
+    return o.to(orig_dtype), T if output_final_state else None
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +92,7 @@ def wla_recurrence_naive(
 # Uses gradient checkpointing + torch.compile on the inner step
 # ---------------------------------------------------------------------------
 
-def _wla_step(
+def _soam_step(
     q_i: torch.Tensor,
     k_i: torch.Tensor,
     v_i: torch.Tensor,
@@ -113,35 +100,31 @@ def _wla_step(
     db: torch.Tensor,
     wa: torch.Tensor,
     wb: torch.Tensor,
-    sigma2: torch.Tensor,
-    S: torch.Tensor,
-    G: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    T: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     score = (k_i * q_i).sum(-1)
-    alpha = torch.sigmoid(da * score + db)[:, None, None]
-    beta = torch.sigmoid(wa * score + wb)[:, None, None]
+    alpha = torch.sigmoid(da * score + db)[:, None, None, None]
+    beta = torch.sigmoid(wa * score + wb)[:, None, None, None]
 
-    S = alpha * S + beta * (k_i.unsqueeze(-1) * v_i.unsqueeze(-2))
-    G = alpha * G + beta * (k_i.unsqueeze(-1) * k_i.unsqueeze(-2))
+    Tk = (T * k_i[:, None, :, None]).sum(2)
+    retrieval = (Tk * k_i[:, :, None]).sum(1)
 
-    d_r = G.shape[-1]
-    eye = torch.eye(d_r, device=G.device, dtype=G.dtype)
-    G_reg = G.detach() + sigma2[:, None, None] * eye
-    q_w = torch.linalg.solve(G_reg, q_i.unsqueeze(-1)).squeeze(-1)
-    q_n = F.normalize(q_w, p=2, dim=-1)
+    error = v_i - retrieval
+    kk = k_i[:, :, None] * k_i[:, None, :]
+    T = alpha * T + beta * (kk.unsqueeze(-1) * error[:, None, None, :])
 
-    o_i = torch.einsum('nrv,nr->nv', S, q_n)
-
-    return o_i, S, G
+    Tq = (T * q_i[:, None, :, None]).sum(2)
+    o_i = (Tq * q_i[:, :, None]).sum(1)
+    return o_i, T
 
 
 try:
-    _wla_step_compiled = torch.compile(_wla_step)
+    _soam_step_compiled = torch.compile(_soam_step)
 except Exception:
-    _wla_step_compiled = _wla_step
+    _soam_step_compiled = _soam_step
 
 
-def _wla_segment_fn(
+def _soam_segment_fn(
     q_r_seg: torch.Tensor,
     k_r_seg: torch.Tensor,
     v_seg: torch.Tensor,
@@ -149,22 +132,20 @@ def _wla_segment_fn(
     db: torch.Tensor,
     wa: torch.Tensor,
     wb: torch.Tensor,
-    sigma2: torch.Tensor,
-    S: torch.Tensor,
-    G: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    T: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     n, t_seg, _ = q_r_seg.shape
     d_v = v_seg.shape[-1]
-    outs = torch.empty(n, t_seg, d_v, device=S.device, dtype=S.dtype)
+    outs = torch.empty(n, t_seg, d_v, device=T.device, dtype=T.dtype)
     for i in range(t_seg):
-        outs[:, i], S, G = _wla_step_compiled(
+        outs[:, i], T = _soam_step_compiled(
             q_r_seg[:, i], k_r_seg[:, i], v_seg[:, i],
-            da, db, wa, wb, sigma2, S, G,
+            da, db, wa, wb, T,
         )
-    return outs, S, G
+    return outs, T
 
 
-def _fused_recurrent_wla(
+def _fused_recurrent_soam(
     q_r: torch.Tensor,
     k_r: torch.Tensor,
     v: torch.Tensor,
@@ -172,7 +153,6 @@ def _fused_recurrent_wla(
     decay_bias: torch.Tensor,
     write_alpha: torch.Tensor,
     write_bias: torch.Tensor,
-    sigma2: torch.Tensor,
     initial_state: tuple[torch.Tensor, ...] | None = None,
     output_final_state: bool = False,
     chunk_size: int = 64,
@@ -187,15 +167,12 @@ def _fused_recurrent_wla(
     db = decay_bias.float()
     wa = write_alpha.float()
     wb = write_bias.float()
-    s2f = sigma2.float()
 
     if initial_state is None:
-        S = torch.zeros((n, d_r, d_v), device=q_r.device, dtype=torch.float32)
-        G = torch.zeros((n, d_r, d_r), device=q_r.device, dtype=torch.float32)
+        T = torch.zeros((n, d_r, d_r, d_v), device=q_r.device, dtype=torch.float32)
     else:
-        S_init, G_init = initial_state
-        S = S_init.reshape(n, d_r, d_v).to(device=q_r.device, dtype=torch.float32).contiguous()
-        G = G_init.reshape(n, d_r, d_r).to(device=q_r.device, dtype=torch.float32).contiguous()
+        (T,) = initial_state
+        T = T.reshape(n, d_r, d_r, d_v).to(device=q_r.device, dtype=torch.float32).contiguous()
 
     use_checkpoint = torch.is_grad_enabled() and (
         q_r.requires_grad or k_r.requires_grad or v.requires_grad
@@ -208,18 +185,15 @@ def _fused_recurrent_wla(
         v_seg = vf[:, seg_start:seg_end]
 
         if use_checkpoint:
-            out_seg, S, G = torch.utils.checkpoint.checkpoint(
-                _wla_segment_fn, q_seg, k_seg, v_seg,
-                da, db, wa, wb, s2f, S, G,
+            out_seg, T = torch.utils.checkpoint.checkpoint(
+                _soam_segment_fn, q_seg, k_seg, v_seg,
+                da, db, wa, wb, T,
                 use_reentrant=False,
             )
         else:
-            out_seg, S, G = _wla_segment_fn(
-                q_seg, k_seg, v_seg, da, db, wa, wb, s2f, S, G,
-            )
+            out_seg, T = _soam_segment_fn(q_seg, k_seg, v_seg, da, db, wa, wb, T)
         out[:, seg_start:seg_end] = out_seg
-
-    final_state = (S, G) if output_final_state else None
+    final_state = (T,) if output_final_state else None
 
     with torch.no_grad():
         mid = min(t // 2, t - 1)
@@ -227,14 +201,15 @@ def _fused_recurrent_wla(
         decay_sample = torch.sigmoid(da * score_sample + db).mean().item()
         write_sample = torch.sigmoid(wa * score_sample + wb).mean().item()
     stats = {
-        "wla_decay_mean": float(decay_sample),
-        "wla_write_mean": float(write_sample),
+        "soam_decay_mean": float(decay_sample),
+        "soam_write_mean": float(write_sample),
     }
     return out.to(q_r.dtype), final_state, stats
 
 
 # ---------------------------------------------------------------------------
 # Entry point: handles [B,T,H,D] reshape and varlen dispatch
+# Matches fla convention: @torch.compiler.disable on entry
 # ---------------------------------------------------------------------------
 
 def _run_varlen(
@@ -245,7 +220,6 @@ def _run_varlen(
     decay_bias: torch.Tensor,
     write_alpha: torch.Tensor,
     write_bias: torch.Tensor,
-    sigma2: torch.Tensor,
     n_heads: int,
     d_r: int,
     d_v: int,
@@ -255,43 +229,32 @@ def _run_varlen(
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None, dict[str, float]]:
     n_seq = cu_seqlens.numel() - 1
     cu = cu_seqlens.tolist()
-
     if initial_state is not None:
-        S0, G0 = initial_state
-        init_reshaped = (
-            S0.reshape(n_seq, n_heads, d_r, d_v).contiguous(),
-            G0.reshape(n_seq, n_heads, d_r, d_r).contiguous(),
-        )
+        (T0,) = initial_state
+        init_reshaped = (T0.reshape(n_seq, n_heads, d_r, d_r, d_v).contiguous(),)
     else:
         init_reshaped = None
 
     out = torch.empty_like(vf)
-    final_chunks: list[list[torch.Tensor]] | None = [[], []] if output_final_state else None
+    final_chunks: list[list[torch.Tensor]] | None = [[]] if output_final_state else None
     decay_means: list[float] = []
     write_means: list[float] = []
 
     for i in range(n_seq):
         bos, eos = int(cu[i]), int(cu[i + 1])
         seg_len = eos - bos
-
-        init_seg = None
-        if init_reshaped is not None:
-            init_seg = (
-                init_reshaped[0][i].contiguous(),
-                init_reshaped[1][i].contiguous(),
-            )
+        init_seg = None if init_reshaped is None else (init_reshaped[0][i].contiguous(),)
 
         if seg_len == 0:
             if output_final_state:
                 if init_seg is None:
-                    final_chunks[0].append(torch.zeros((n_heads, d_r, d_v), device=q_rf.device, dtype=torch.float32))
-                    final_chunks[1].append(torch.zeros((n_heads, d_r, d_r), device=q_rf.device, dtype=torch.float32))
+                    end_seg = (torch.zeros((n_heads, d_r, d_r, d_v), device=q_rf.device, dtype=torch.float32),)
                 else:
-                    final_chunks[0].append(init_seg[0])
-                    final_chunks[1].append(init_seg[1])
+                    end_seg = init_seg
+                final_chunks[0].append(end_seg[0])
             continue
 
-        out_seg, st_seg, stats_seg = _fused_recurrent_wla(
+        out_seg, st_seg, stats_seg = _fused_recurrent_soam(
             q_r=q_rf[:, bos:eos, :],
             k_r=k_rf[:, bos:eos, :],
             v=vf[:, bos:eos, :],
@@ -299,31 +262,24 @@ def _run_varlen(
             decay_bias=decay_bias,
             write_alpha=write_alpha,
             write_bias=write_bias,
-            sigma2=sigma2,
             initial_state=init_seg,
             output_final_state=output_final_state,
         )
         out[:, bos:eos, :] = out_seg
-        decay_means.append(stats_seg["wla_decay_mean"])
-        write_means.append(stats_seg["wla_write_mean"])
+        decay_means.append(stats_seg["soam_decay_mean"])
+        write_means.append(stats_seg["soam_write_mean"])
         if output_final_state:
             final_chunks[0].append(st_seg[0])
-            final_chunks[1].append(st_seg[1])
 
-    final_state = None
-    if output_final_state:
-        final_state = (
-            torch.stack(final_chunks[0], dim=0),
-            torch.stack(final_chunks[1], dim=0),
-        )
+    final_state = (torch.stack(final_chunks[0], dim=0),) if output_final_state else None
     stats = {
-        "wla_decay_mean": float(sum(decay_means) / max(len(decay_means), 1)),
-        "wla_write_mean": float(sum(write_means) / max(len(write_means), 1)),
+        "soam_decay_mean": float(sum(decay_means) / max(len(decay_means), 1)),
+        "soam_write_mean": float(sum(write_means) / max(len(write_means), 1)),
     }
     return out, final_state, stats
 
 
-def _triton_wla_path(
+def _triton_soam_path(
     q_r: torch.Tensor,
     k_r: torch.Tensor,
     v: torch.Tensor,
@@ -331,7 +287,6 @@ def _triton_wla_path(
     decay_bias: torch.Tensor,
     write_alpha: torch.Tensor,
     write_bias: torch.Tensor,
-    sigma2: torch.Tensor,
     initial_state: tuple[torch.Tensor, ...] | None = None,
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
@@ -347,38 +302,36 @@ def _triton_wla_path(
     alpha = torch.sigmoid(decay_alpha * score + decay_bias).detach()
     beta = torch.sigmoid(write_alpha * score + write_bias)
 
-    triton_init = None
+    h0 = None
     if initial_state is not None:
-        S0, G0 = initial_state
-        n_init = S0.shape[0]
-        triton_init = (
-            S0.reshape(n_init * n_heads, d_r, d_v).contiguous().float(),
-            G0.reshape(n_init * n_heads, d_r * d_r).contiguous().float(),
-        )
+        (T0,) = initial_state
+        n_init = T0.shape[0]
+        h0 = T0.reshape(n_init * n_heads, d_r * d_r, d_v).contiguous().float()
 
-    o, final_state = fused_recurrent_wla(
+    o, ht = fused_recurrent_soam(
         q_r=q_c.float(), k_r=k_c.float(), v=v_c.float(),
-        alpha=alpha, beta=beta, sigma2=sigma2,
-        initial_state=triton_init,
+        alpha=alpha, beta=beta,
+        initial_state=h0,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
     )
 
-    final_out = None
-    if output_final_state and final_state is not None:
-        final_out = final_state
+    final_state = None
+    if output_final_state and ht is not None:
+        n_out = cu_seqlens.numel() - 1 if cu_seqlens is not None else batch
+        final_state = (ht.reshape(n_out, n_heads, d_r, d_r, d_v).contiguous(),)
 
     with torch.no_grad():
         mid = min(seqlen // 2, seqlen - 1)
         stats = {
-            "wla_decay_mean": alpha[:, mid].mean().item(),
-            "wla_write_mean": beta[:, mid].mean().item(),
+            "soam_decay_mean": alpha[:, mid].mean().item(),
+            "soam_write_mean": beta[:, mid].mean().item(),
         }
-    return o.to(q_r.dtype), final_out, stats
+    return o.to(q_r.dtype), final_state, stats
 
 
 @torch.compiler.disable
-def wla_linear_attention(
+def soam_linear_attention(
     q_r: torch.Tensor,
     k_r: torch.Tensor,
     v: torch.Tensor,
@@ -386,7 +339,6 @@ def wla_linear_attention(
     decay_bias: torch.Tensor,
     write_alpha: torch.Tensor,
     write_bias: torch.Tensor,
-    sigma2: torch.Tensor,
     initial_state: tuple[torch.Tensor, ...] | None = None,
     output_final_state: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
@@ -398,12 +350,11 @@ def wla_linear_attention(
         k_r: [B, T, H, d_r]
         v:   [B, T, H, d_v]
         decay_alpha, decay_bias, write_alpha, write_bias: [H]
-        sigma2: [H] per-head noise floor (exp of learnable log_sigma2)
-        initial_state: (S[N,H,d_r,d_v], G[N,H,d_r,d_r]) or None
-        use_triton: None=auto, True=force Triton, False=force PyTorch
+        initial_state: tuple of [N, H, d_r, d_r, d_v] or None
+        use_triton: None=auto (use Triton on CUDA), True=force, False=force PyTorch
     Returns:
         o: [B, T, H, d_v]
-        final_state: tuple or None
+        final_state: tuple of [N, H, d_r, d_r, d_v] or None
         stats: dict
     """
     if q_r.ndim != 4 or k_r.ndim != 4 or v.ndim != 4:
@@ -412,9 +363,9 @@ def wla_linear_attention(
     if use_triton is None:
         use_triton = _TRITON_AVAILABLE and q_r.is_cuda
     if use_triton:
-        return _triton_wla_path(
+        return _triton_soam_path(
             q_r, k_r, v,
-            decay_alpha, decay_bias, write_alpha, write_bias, sigma2,
+            decay_alpha, decay_bias, write_alpha, write_bias,
             initial_state, output_final_state, cu_seqlens,
         )
 
@@ -429,24 +380,19 @@ def wla_linear_attention(
     db = decay_bias.repeat(batch)
     wa = write_alpha.repeat(batch)
     wb = write_bias.repeat(batch)
-    s2 = sigma2.repeat(batch)
 
     def _flatten_init(state):
         if state is None:
             return None
-        S, G = state
-        return (
-            S.reshape(batch * n_heads, d_r, d_v).contiguous(),
-            G.reshape(batch * n_heads, d_r, d_r).contiguous(),
-        )
+        (T,) = state
+        return (T.reshape(batch * n_heads, d_r, d_r, d_v).contiguous(),)
 
     init_flat = _flatten_init(initial_state)
     if cu_seqlens is None:
-        out_flat, final_flat, stats = _fused_recurrent_wla(
+        out_flat, final_flat, stats = _fused_recurrent_soam(
             q_r=q_f, k_r=k_f, v=v_f,
             decay_alpha=da, decay_bias=db,
             write_alpha=wa, write_bias=wb,
-            sigma2=s2,
             initial_state=init_flat,
             output_final_state=output_final_state,
         )
@@ -455,7 +401,6 @@ def wla_linear_attention(
             q_rf=q_f, k_rf=k_f, vf=v_f,
             decay_alpha=da, decay_bias=db,
             write_alpha=wa, write_bias=wb,
-            sigma2=s2,
             n_heads=n_heads, d_r=d_r, d_v=d_v,
             cu_seqlens=cu_seqlens,
             initial_state=initial_state,
@@ -465,12 +410,9 @@ def wla_linear_attention(
     out = out_flat.reshape(batch, n_heads, seqlen, d_v).permute(0, 2, 1, 3).contiguous()
     final_state = None
     if output_final_state and final_flat is not None:
-        S_final, G_final = final_flat
+        (T_final,) = final_flat
         n_out = cu_seqlens.numel() - 1 if cu_seqlens is not None else batch
-        final_state = (
-            S_final.reshape(n_out, n_heads, d_r, d_v).contiguous(),
-            G_final.reshape(n_out, n_heads, d_r, d_r).contiguous(),
-        )
+        final_state = (T_final.reshape(n_out, n_heads, d_r, d_r, d_v).contiguous(),)
     return out, final_state, stats
 
 
@@ -478,7 +420,7 @@ def wla_linear_attention(
 # nn.Module layer — matches fla/layers/delta_net.py pattern
 # ---------------------------------------------------------------------------
 
-class WLALinearAttention(nn.Module):
+class SOAMLinearAttention(nn.Module):
 
     def __init__(
         self,
@@ -504,7 +446,6 @@ class WLALinearAttention(nn.Module):
         write_bias_init: float = 0.0,
         qk_l2_norm: bool = True,
         qk_l2_norm_eps: float = 1e-6,
-        sigma2_init: float = 5.0,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -544,8 +485,6 @@ class WLALinearAttention(nn.Module):
         self.decay_bias = nn.Parameter(torch.full((num_heads,), decay_bias_init))
         self.write_alpha = nn.Parameter(torch.full((num_heads,), write_alpha_init))
         self.write_bias = nn.Parameter(torch.full((num_heads,), write_bias_init))
-
-        self.log_sigma2 = nn.Parameter(torch.full((num_heads,), math.log(sigma2_init)))
 
         if use_short_conv:
             self.q_conv1d = ShortConvolution(
@@ -668,9 +607,7 @@ class WLALinearAttention(nn.Module):
             k_r = repeat(k_r, "b t h d -> b t (h g) d", g=self.num_kv_groups)
             v = repeat(v, "b t h d -> b t (h g) d", g=self.num_kv_groups)
 
-        sigma2 = torch.exp(self.log_sigma2)
-
-        o, recurrent_state, stats = wla_linear_attention(
+        o, recurrent_state, stats = soam_linear_attention(
             q_r=q_r,
             k_r=k_r,
             v=v,
@@ -678,7 +615,6 @@ class WLALinearAttention(nn.Module):
             decay_bias=self.decay_bias,
             write_alpha=self.write_alpha,
             write_bias=self.write_bias,
-            sigma2=sigma2,
             initial_state=recurrent_state,
             output_final_state=bool(use_cache),
             cu_seqlens=cu_seqlens,
@@ -702,7 +638,7 @@ class WLALinearAttention(nn.Module):
 
 
 __all__ = [
-    "WLALinearAttention",
-    "wla_linear_attention",
-    "wla_recurrence_naive",
+    "SOAMLinearAttention",
+    "soam_linear_attention",
+    "soam_recurrence_naive",
 ]

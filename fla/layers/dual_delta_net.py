@@ -12,7 +12,7 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
-from .dual_delta_rule import fused_recurrent_dual_delta_rule
+from fla.ops.dual_delta_rule import fused_recurrent_dual_delta_rule
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack

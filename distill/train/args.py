@@ -245,6 +245,42 @@ class ModelArguments:
         default=1.0,
         metadata={"help": "Initial softmax temperature beta for SiSA (stored as log_beta = log(beta_init))."}
     )
+    css_mode: str = field(
+        default="fused_chunk",
+        metadata={"help": "Backend mode for CSS: chunk, fused_chunk, or fused_recurrent."}
+    )
+    css_proj_rank: int = field(
+        default=22,
+        metadata={"help": "Low-rank projection dimension for CSS kernel."}
+    )
+    css_decay_init: float = field(
+        default=4.0,
+        metadata={"help": "Initial raw decay logit for CSS (passed through logsigmoid)."}
+    )
+    css_denom_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon for denominator in CSS linear attention."}
+    )
+    css_proj_normalize: bool = field(
+        default=True,
+        metadata={"help": "L2-normalize projected vectors before vech in CSS."}
+    )
+    css_proj_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon for projection normalization in CSS."}
+    )
+    css_qk_l2_norm: bool = field(
+        default=True,
+        metadata={"help": "Apply per-head L2 normalization to q/k before projection in CSS."}
+    )
+    css_qk_l2_norm_eps: float = field(
+        default=1.0e-6,
+        metadata={"help": "Epsilon for q/k L2 normalization in CSS."}
+    )
+    css_output_norm: str = field(
+        default="identity",
+        metadata={"help": "Output normalization for CSS: identity or rmsnorm."}
+    )
     performer_nb_features: int = field(
         default=None,
         metadata={"help": "Number of random features for Performer/Performer+ kernels. None keeps model default."}

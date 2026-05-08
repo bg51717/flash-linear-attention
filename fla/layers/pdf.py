@@ -12,7 +12,7 @@ from einops import rearrange, repeat
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import RMSNorm, ShortConvolution
 
-from .linear_attention_pdf_triton import first_order_linear_attention
+from fla.ops.pdf import first_order_linear_attention
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack

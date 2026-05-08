@@ -13,18 +13,16 @@ from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules.l2norm import l2norm_fwd
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 
-from .linear_attention_performer import (
+from fla.layers.performer import (
     _build_gaussian_orthogonal_random_matrix,
     performer_softmax_feature_map,
 )
-from .linear_attention_performer_plus_triton import (
-    _TRITON_AVAILABLE as _PERFORMER_PLUS_TRITON_AVAILABLE,
-)
-from .linear_attention_performer_plus_triton import (
+from fla.ops.performer_plus import (
     performer_plus_causal_linear_attention_triton,
-)
-from .linear_attention_performer_plus_triton import (
     performer_plus_pdf_delta_attention_triton,
+)
+from fla.ops.performer_plus.fused_recurrent import (
+    _TRITON_AVAILABLE as _PERFORMER_PLUS_TRITON_AVAILABLE,
 )
 
 if TYPE_CHECKING:

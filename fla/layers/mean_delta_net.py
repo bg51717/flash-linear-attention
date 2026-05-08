@@ -13,7 +13,7 @@ from torch.nn import functional as F
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 
-from .mean_delta_rule import fused_recurrent_mean_delta_rule
+from fla.ops.mean_delta_rule import fused_recurrent_mean_delta_rule
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack

@@ -26,6 +26,18 @@ from .retention import chunk_retention, fused_chunk_retention, fused_recurrent_r
 from .rwkv6 import chunk_rwkv6, fused_recurrent_rwkv6
 from .rwkv7 import chunk_rwkv7, fused_recurrent_rwkv7
 from .simple_gla import chunk_simple_gla, fused_chunk_simple_gla, fused_recurrent_simple_gla, parallel_simple_gla
+from .sisa import fused_recurrent_sisa
+from .soam import fused_recurrent_soam
+from .wla import fused_recurrent_wla
+from .pdf import first_order_linear_attention
+from .pdf_final import pdf_final_linear_attention_triton
+from .approxnet_v2 import approxnet_v2_linear_attention_triton
+from .approxnet_v3 import approxnet_v3_linear_attention_triton
+from .approxnet_v4 import approxnet_v4_linear_attention_triton
+from .performer import performer_causal_linear_attention_triton
+from .performer_plus import performer_plus_causal_linear_attention_triton, performer_plus_pdf_delta_attention_triton
+from .dual_delta_rule import fused_recurrent_dual_delta_rule
+from .mean_delta_rule import fused_recurrent_mean_delta_rule
 
 __all__ = [
     'chunk_abc',
@@ -51,4 +63,17 @@ __all__ = [
     'chunk_rwkv6', 'fused_recurrent_rwkv6',
     'chunk_rwkv7', 'fused_recurrent_rwkv7',
     'chunk_simple_gla', 'fused_chunk_simple_gla', 'fused_recurrent_simple_gla', 'parallel_simple_gla',
+    'fused_recurrent_sisa',
+    'fused_recurrent_soam',
+    'fused_recurrent_wla',
+    'first_order_linear_attention',
+    'pdf_final_linear_attention_triton',
+    'approxnet_v2_linear_attention_triton',
+    'approxnet_v3_linear_attention_triton',
+    'approxnet_v4_linear_attention_triton',
+    'performer_causal_linear_attention_triton',
+    'performer_plus_causal_linear_attention_triton',
+    'performer_plus_pdf_delta_attention_triton',
+    'fused_recurrent_dual_delta_rule',
+    'fused_recurrent_mean_delta_rule',
 ]

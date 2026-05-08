@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 try:
-    from .linear_attention_pdf_triton_kernels import triton_first_order_linear_attention
+    from .triton_kernels import triton_first_order_linear_attention
 
     _TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover - runtime fallback

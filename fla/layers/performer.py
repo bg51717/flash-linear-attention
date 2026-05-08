@@ -12,11 +12,9 @@ from einops import rearrange, repeat
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import RMSNorm, ShortConvolution
 
-from .linear_attention_performer_triton import (
+from fla.ops.performer import performer_causal_linear_attention_triton
+from fla.ops.performer.fused_recurrent import (
     _TRITON_AVAILABLE as _PERFORMER_TRITON_AVAILABLE,
-)
-from .linear_attention_performer_triton import (
-    performer_causal_linear_attention_triton,
 )
 
 if TYPE_CHECKING:

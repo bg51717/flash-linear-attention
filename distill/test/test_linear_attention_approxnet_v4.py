@@ -16,11 +16,11 @@ if _ROOT not in sys.path:
 
 _IMPORT_ERROR: Exception | None = None
 try:
-    from distill.models.linear_attention_approxnet_v4 import (
+    from fla.layers.approxnet_v4 import (
         ApproxNetV4LinearAttention,
         approxnet_v4_linear_attention,
     )
-    from distill.models.linear_attention_approxnet_v4_triton import (
+    from fla.ops.approxnet_v4.fused_recurrent import (
         _TRITON_AVAILABLE as _APPROXNET_V4_TRITON_AVAILABLE,
         approxnet_v4_linear_attention_triton,
     )

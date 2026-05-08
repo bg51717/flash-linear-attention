@@ -17,12 +17,12 @@ if _ROOT not in sys.path:
 
 _IMPORT_ERROR: Exception | None = None
 try:
-    from distill.models.linear_attention_performer_plus import (
+    from fla.layers.performer_plus import (
         _PERFORMER_PLUS_TRITON_AVAILABLE,
         PerformerPlusLinearAttention,
         performer_plus_pdf_delta_attention,
     )
-    from distill.models.linear_attention_performer_plus_triton import (
+    from fla.ops.performer_plus.fused_recurrent import (
         performer_plus_pdf_delta_attention_triton,
     )
 except Exception as exc:  # pragma: no cover

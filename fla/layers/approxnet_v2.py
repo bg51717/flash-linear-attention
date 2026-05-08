@@ -13,13 +13,13 @@ from fla.modules import RMSNorm, RotaryEmbedding, ShortConvolution
 from fla.ops.utils.index import prepare_lens_from_mask
 
 try:
-    from .linear_attention_approxnet_v3_triton import (
-        _TRITON_AVAILABLE as _APPROXNET_V3_TRITON_AVAILABLE,
-        approxnet_v3_linear_attention_triton,
+    from fla.ops.approxnet_v2 import approxnet_v2_linear_attention_triton
+    from fla.ops.approxnet_v2.fused_recurrent import (
+        _TRITON_AVAILABLE as _APPROXNET_V2_TRITON_AVAILABLE,
     )
 except Exception:  # pragma: no cover
-    _APPROXNET_V3_TRITON_AVAILABLE = False
-    approxnet_v3_linear_attention_triton = None
+    _APPROXNET_V2_TRITON_AVAILABLE = False
+    approxnet_v2_linear_attention_triton = None
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -61,7 +61,7 @@ def _prepare_initial_state(
     return d_state, nu, kap, r_sum, o_prev, q_prev, count
 
 
-def _torch_approxnet_v3_dense(
+def _torch_approxnet_v2_dense(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -98,9 +98,7 @@ def _torch_approxnet_v3_dense(
         d_state = d_state + lam[:, None, None] * torch.einsum("nv,nk->nvk", x_i, y_i)
 
         dq_i = q_i - q_prev
-        # v3 change: scale D_t * dq by 1/max(count, 1)
-        inv_count = torch.where(count > 0, count.reciprocal(), torch.zeros_like(count))
-        o_hist = o_prev + inv_count[:, None] * torch.einsum("nvk,nk->nv", d_state, dq_i)
+        o_hist = o_prev + torch.einsum("nvk,nk->nv", d_state, dq_i)
 
         score = torch.sum(k_i * q_i, dim=-1)
         if use_sigmoid_gate:
@@ -128,9 +126,9 @@ def _torch_approxnet_v3_dense(
 
     final_state = (d_state, nu, kap, r_sum, o_prev, q_prev, count) if output_final_state else None
     stats = {
-        "approxnet_v3_beta_mean": beta_mean_sum / max(t, 1),
-        "approxnet_v3_den_min": den_min if t > 0 else 0.0,
-        "approxnet_v3_den_neg_frac": den_neg_sum / max(t, 1),
+        "approxnet_v2_beta_mean": beta_mean_sum / max(t, 1),
+        "approxnet_v2_den_min": den_min if t > 0 else 0.0,
+        "approxnet_v2_den_neg_frac": den_neg_sum / max(t, 1),
     }
     return out.to(q.dtype), final_state, stats
 
@@ -241,7 +239,7 @@ def _run_varlen(
                     final_chunks[idx].append(end_seg[idx])
             continue
 
-        out_seg, st_seg, stats_seg = _torch_approxnet_v3_dense(
+        out_seg, st_seg, stats_seg = _torch_approxnet_v2_dense(
             q=qf[:, bos:eos, :],
             k=kf[:, bos:eos, :],
             v=vf[:, bos:eos, :],
@@ -252,23 +250,23 @@ def _run_varlen(
             use_sigmoid_gate=use_sigmoid_gate,
         )
         out[:, bos:eos, :] = out_seg
-        beta_means.append(stats_seg["approxnet_v3_beta_mean"])
-        den_negs.append(stats_seg["approxnet_v3_den_neg_frac"])
-        den_mins.append(stats_seg["approxnet_v3_den_min"])
+        beta_means.append(stats_seg["approxnet_v2_beta_mean"])
+        den_negs.append(stats_seg["approxnet_v2_den_neg_frac"])
+        den_mins.append(stats_seg["approxnet_v2_den_min"])
         if output_final_state:
             for idx in range(7):
                 final_chunks[idx].append(st_seg[idx])
 
     final_state = tuple(torch.stack(chunks, dim=0) for chunks in final_chunks) if output_final_state else None
     stats = {
-        "approxnet_v3_beta_mean": float(sum(beta_means) / max(len(beta_means), 1)),
-        "approxnet_v3_den_neg_frac": float(sum(den_negs) / max(len(den_negs), 1)),
-        "approxnet_v3_den_min": float(min(den_mins)) if den_mins else 0.0,
+        "approxnet_v2_beta_mean": float(sum(beta_means) / max(len(beta_means), 1)),
+        "approxnet_v2_den_neg_frac": float(sum(den_negs) / max(len(den_negs), 1)),
+        "approxnet_v2_den_min": float(min(den_mins)) if den_mins else 0.0,
     }
     return out, final_state, stats
 
 
-def approxnet_v3_linear_attention(
+def approxnet_v2_linear_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -294,7 +292,7 @@ def approxnet_v3_linear_attention(
 
     init_flat = _flatten_initial_state(initial_state, batch, n_heads, v_dim, k_dim)
     if cu_seqlens is None:
-        out_flat, final_flat, stats = _torch_approxnet_v3_dense(
+        out_flat, final_flat, stats = _torch_approxnet_v2_dense(
             q=qf,
             k=kf,
             v=vf,
@@ -328,7 +326,7 @@ def approxnet_v3_linear_attention(
     return out, final_state, stats
 
 
-class ApproxNetV3LinearAttention(nn.Module):
+class ApproxNetV2LinearAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int = 2048,
@@ -509,12 +507,12 @@ class ApproxNetV3LinearAttention(nn.Module):
         grad_enabled = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
         use_triton_path = bool(
             self.use_triton
-            and _APPROXNET_V3_TRITON_AVAILABLE
+            and _APPROXNET_V2_TRITON_AVAILABLE
             and q.is_cuda
             and not (stateful and grad_enabled)
         )
         if use_triton_path:
-            o, recurrent_state, stats = approxnet_v3_linear_attention_triton(
+            o, recurrent_state, stats = approxnet_v2_linear_attention_triton(
                 q=q,
                 k=k,
                 v=v,
@@ -527,7 +525,7 @@ class ApproxNetV3LinearAttention(nn.Module):
                 use_sigmoid_gate=self.use_sigmoid_gate,
             )
         else:
-            o, recurrent_state, stats = approxnet_v3_linear_attention(
+            o, recurrent_state, stats = approxnet_v2_linear_attention(
                 q=q,
                 k=k,
                 v=v,
@@ -557,6 +555,6 @@ class ApproxNetV3LinearAttention(nn.Module):
 
 
 __all__ = [
-    "ApproxNetV3LinearAttention",
-    "approxnet_v3_linear_attention",
+    "ApproxNetV2LinearAttention",
+    "approxnet_v2_linear_attention",
 ]
